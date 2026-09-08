@@ -1,3 +1,7 @@
 .DS_Store
 supabase/.temp/
 supabase/.branches/
+
+# Source material for the SRS merge, not part of the app
+files/
+files.zip

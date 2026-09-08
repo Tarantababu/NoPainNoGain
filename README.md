@@ -16,6 +16,7 @@ No build step, no bundler, no server. Open `index.html` and it runs: React 18, B
 - **Keeps every language separate.** Your German level, vocabulary and history never touch your Spanish ones.
 - **Up to five learner profiles**, each with completely independent progress.
 - **Daily stats and streaks** so you can see the habit forming.
+- **Spaced repetition over your saved phrases** — Wordstack's flashcard engine, built in.
 - **Exports your vocabulary** as CSV or plain text, with Turkish translations.
 
 ---
@@ -169,6 +170,30 @@ Up to **five learner profiles** share one install — useful for a couple, a fam
 Each profile owns its languages, levels, vocabulary, session history and streak. Nothing is shared between them.
 
 The five-profile cap is enforced by a database trigger, not just the UI, so a stray tab or a direct API call cannot exceed it either. Deleting a profile erases that person's vocabulary, sessions and levels in every language — the UI asks twice, and it cannot be undone.
+
+---
+
+## Flashcards and spaced repetition
+
+Talking generates vocabulary; SRS makes it stick. Any saved phrase can be **forged** into a card set from the Flashcards panel on the dashboard.
+
+Forging a phrase calls GPT-4o for **six natural example sentences** (idiomatic, varied in tense and register, each containing the phrase — inflected or separated where the language does that) and then records **one mp3 per sentence** with `tts-1`. That set becomes **13 cards**:
+
+| Deck | Cards | What you do |
+| --- | --- | --- |
+| Reading | 1 | See all six sentences with the phrase highlighted; recall its meaning |
+| Listening | 6 | Hear a sentence; recall it, then check the text and translation |
+| Speaking | 6 | See the sentence with the phrase blanked out; say it aloud, then shadow the audio |
+
+**Scheduling is Anki-style SM-2**, ported unchanged: learning steps at 1 min and 10 min, graduating to 1 day (4 for Easy), then intervals driven by an ease factor that Again/Hard/Good/Easy move up and down. Lapses drop the card into a 10-minute relearning step. Each rating button shows the interval it will produce before you press it.
+
+Keyboard: **space** reveals the answer, **1–4** rate Again/Hard/Good/Easy, **Esc** leaves the session.
+
+**New cards per day** is capped (20 by default, editable on the dashboard) and counted per language, so studying German does not eat your Spanish budget.
+
+**Anki export** lives in the export sheet: three `.txt` files with `#deck` headers and base64 audio embedded, the Speaking file typed as Cloze. Import them and Anki schedules independently of the in-app queue.
+
+Audio is stored as base64 in Postgres rather than in a storage bucket. That keeps the app to one file with no bucket policies to configure, and it is what makes the Anki export self-contained — at roughly 150–250 KB per phrase, the free tier holds a couple of thousand phrases.
 
 ---
 

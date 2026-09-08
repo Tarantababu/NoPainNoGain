@@ -71,6 +71,8 @@
 
   .safe-b { padding-bottom: env(safe-area-inset-bottom, 0px); }
   .no-tap { -webkit-tap-highlight-color: transparent; }
+  .srs-face audio { width: 100%; }
+  .srs-face { margin-bottom: 10px; }
 </style>
 </head>
 <body class="bg-gray-900 text-white">
@@ -341,6 +343,12 @@ function newLearnerId() {
     ? window.crypto.randomUUID()
     : String(Date.now()) + Math.random().toString(16).slice(2);
   return 'learner_' + rand;
+}
+
+function missingSrsTables(error) {
+  const msg = (error && error.message ? error.message : String(error || '')).toLowerCase();
+  return (msg.indexOf('vocab_sets') !== -1 || msg.indexOf('srs_reviews') !== -1 || msg.indexOf('srs_revlog') !== -1) &&
+    (msg.indexOf('does not exist') !== -1 || msg.indexOf('schema cache') !== -1);
 }
 
 function missingLearnersTable(error) {
@@ -991,6 +999,421 @@ function buildAnalysisPrompt(profile, topic, transcript, activeVocab) {
   ].join('\n');
 }
 
+/* ============================================================================
+   SPACED REPETITION — ported from Wordstack, driven by saved vocabulary.
+
+   Each saved phrase is forged into a card set: six natural example sentences
+   plus one mp3 per sentence. That set yields 13 cards — 1 reading, 6 listening,
+   6 speaking-cloze — scheduled with the same SM-2 variant Wordstack uses.
+   ========================================================================== */
+
+const SRS_DECKS = ['reading', 'listening', 'speaking'];
+const LEARN_STEPS_MIN = [1, 10];
+const RELEARN_STEPS_MIN = [10];
+const LEARN_AHEAD_MIN = 20;
+const DEFAULT_NEW_PER_DAY = 20;
+const SENTENCES_PER_SET = 6;
+
+const CARD_ACCENTS = {
+  reading:   ['#2B59C3', '#7C3AED'],
+  listening: ['#0EA5A4', '#2B59C3'],
+  speaking:  ['#E8590C', '#F5C400']
+};
+
+/* ---------- text helpers (verbatim behaviour from the original) ---------- */
+
+const esc = v => String(v == null ? '' : v)
+  .replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;')
+  .replaceAll('"', '&quot;').replaceAll("'", '&#39;');
+
+const stripField = v => String(v == null ? '' : v).replace(/\t/g, ' ').replace(/\r?\n/g, '<br>');
+const rescape = v => v.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+const splitPhrase = w => String(w == null ? '' : w)
+  .split(/\s*(?:\.{2,}|…)\s*/)
+  .map(t => t.trim())
+  .filter(Boolean);
+
+function findParts(safe, parts) {
+  const ranges = [];
+  let from = 0;
+  for (const part of parts) {
+    const pat = new RegExp(rescape(esc(part)), 'ig');
+    pat.lastIndex = from;
+    const m = pat.exec(safe);
+    if (!m) return null;
+    ranges.push([m.index, m.index + m[0].length]);
+    from = m.index + m[0].length;
+  }
+  return ranges;
+}
+
+function wrapRanges(safe, ranges, wrapFn) {
+  let out = '';
+  let prev = 0;
+  ranges.forEach(r => {
+    out += safe.slice(prev, r[0]) + wrapFn(safe.slice(r[0], r[1]));
+    prev = r[1];
+  });
+  return out + safe.slice(prev);
+}
+
+const CARD_FONT = "-apple-system,'Segoe UI',Roboto,'Noto Sans','Helvetica Neue',sans-serif";
+const HL_B = inner =>
+  '<b style="font-weight:700;color:#1E2A38;background:#FFE45C;padding:0 .18em;border-radius:4px;">' + inner + '</b>';
+const NATIVE_SPAN = t => '<span style="color: #666666; font-size: 0.9em;">' + t + '</span>';
+const AUDIO_TAG = b64 => b64
+  ? '<audio controls preload="none" style="width:100%;max-width:420px;" src="data:audio/mp3;base64,' + b64 + '"></audio>'
+  : '<div style="font-size:.85em;color:#8A94A6;border:1px dashed #C9D2DD;border-radius:8px;padding:8px 12px;">Audio is still loading for this card.</div>';
+
+function boldify(sentence, form, baseWord) {
+  const safe = esc(sentence);
+  const needles = [form, baseWord];
+  for (const needle of needles) {
+    const parts = splitPhrase(needle);
+    if (!parts.length) continue;
+    if (parts.length === 1) {
+      const pattern = new RegExp(rescape(esc(parts[0])), 'gi');
+      if (pattern.test(safe)) return safe.replace(pattern, m => HL_B(m));
+    } else {
+      const ranges = findParts(safe, parts);
+      if (ranges) return wrapRanges(safe, ranges, m => HL_B(m));
+    }
+  }
+  return safe;
+}
+
+function clozify(sentence, form, baseWord, hint) {
+  const safe = esc(sentence);
+  const hintSpan = NATIVE_SPAN(esc(hint));
+  const wrap = m => '{{c1::' + HL_B(m) + '::' + hintSpan + '}}';
+  for (const needle of [form, baseWord]) {
+    const parts = splitPhrase(needle);
+    if (!parts.length) continue;
+    const ranges = findParts(safe, parts);
+    if (ranges) return wrapRanges(safe, ranges, wrap);
+  }
+  return wrap(safe);
+}
+
+function cardShell(inner, accentFrom, accentTo, badge) {
+  return '<div style="font-family:' + CARD_FONT + ';max-width:560px;margin:8px auto;text-align:left;background:#FFFFFF;border:1px solid #E3E8F0;border-radius:16px;overflow:hidden;box-shadow:0 6px 18px rgba(20,30,55,.10);">'
+    + '<div style="height:6px;background:linear-gradient(90deg,' + accentFrom + ',' + accentTo + ');"></div>'
+    + '<div style="padding:16px 20px 18px;">'
+    + (badge ? '<div style="font-size:.68em;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:#8A94A6;margin-bottom:10px;">' + badge + '</div>' : '')
+    + inner
+    + '</div></div>';
+}
+
+const numChip = n =>
+  '<span style="flex:none;display:inline-block;width:22px;height:22px;line-height:22px;text-align:center;background:#EEF2FB;color:#2B59C3;border-radius:50%;font-size:.72em;font-weight:700;margin-right:10px;">' + n + '</span>';
+
+const sentenceRow = (n, html) =>
+  '<div style="display:flex;align-items:flex-start;margin:9px 0;font-size:1.04em;line-height:1.6;color:#1E2A38;">' + numChip(n) + '<span>' + html + '</span></div>';
+
+const wordChip = (word, translation) =>
+  '<div style="display:inline-block;background:#1E2A38;color:#FFE45C;font-weight:700;font-size:1.15em;padding:6px 14px;border-radius:10px;">' + word + '</div>'
+  + (translation ? '<div style="margin-top:10px;font-size:1.05em;color:#1E2A38;font-weight:600;">' + translation + '</div>' : '');
+
+/* ---------- the three card faces ---------- */
+
+function readingFront(set) {
+  const rows = set.data.sentences
+    .map((s, i) => sentenceRow(i + 1, boldify(s.target, s.word_form, set.phrase)))
+    .join('');
+  return cardShell(rows, CARD_ACCENTS.reading[0], CARD_ACCENTS.reading[1], 'Reading · spot the phrase');
+}
+
+function readingBack(set) {
+  const inner = wordChip(esc(set.phrase), esc(set.data.word_translation))
+    + '<div style="margin-top:10px;">' + NATIVE_SPAN(esc(set.data.definition)) + '</div>';
+  return cardShell(inner, CARD_ACCENTS.reading[0], CARD_ACCENTS.reading[1], 'Meaning');
+}
+
+function listeningFront(audioB64) {
+  const inner = '<div style="text-align:center;padding:4px 0 2px;">'
+    + '<div style="font-size:2em;line-height:1;margin-bottom:10px;">🎧</div>'
+    + AUDIO_TAG(audioB64)
+    + '<div style="margin-top:10px;font-size:.8em;color:#8A94A6;">Listen, then recall the full sentence</div>'
+    + '</div>';
+  return cardShell(inner, CARD_ACCENTS.listening[0], CARD_ACCENTS.listening[1], 'Listening');
+}
+
+function listeningBack(set, s) {
+  const inner = '<div style="font-size:1.1em;line-height:1.6;color:#1E2A38;">'
+    + boldify(s.target, s.word_form, set.phrase) + '</div>'
+    + '<div style="margin-top:8px;">' + NATIVE_SPAN(esc(s.native)) + '</div>';
+  return cardShell(inner, CARD_ACCENTS.listening[0], CARD_ACCENTS.listening[1], 'Sentence');
+}
+
+function speakingText(set, s) {
+  const cloze = clozify(s.target, s.word_form, set.phrase, set.data.word_translation);
+  const inner = '<div style="font-size:1.1em;line-height:1.7;color:#1E2A38;">' + cloze + '</div>'
+    + '<div style="margin-top:12px;font-size:.8em;color:#8A94A6;">Say the complete sentence out loud</div>';
+  return cardShell(inner, CARD_ACCENTS.speaking[0], CARD_ACCENTS.speaking[1], 'Speaking · fill the gap');
+}
+
+function speakingExtra(set, s, audioB64) {
+  const inner = AUDIO_TAG(audioB64)
+    + '<div style="margin-top:10px;">' + NATIVE_SPAN(esc(s.native)) + '</div>'
+    + '<div style="margin-top:8px;font-size:.8em;color:#8A94A6;">Shadow the audio two or three times</div>';
+  return cardShell(inner, CARD_ACCENTS.speaking[0], CARD_ACCENTS.speaking[1], 'Answer · shadow it');
+}
+
+/* ---------- SM-2 scheduler ---------- */
+
+function newRev(cardId, setId, deck, idx, learnerId, language) {
+  const now = new Date().toISOString();
+  return {
+    card_id: cardId, user_id: learnerId, target_language: language,
+    set_id: setId, deck: deck, idx: idx,
+    state: 'new', step: 0, ivl: 0, ef: 2.5, reps: 0, lapses: 0,
+    due_at: now, updated_at: now
+  };
+}
+
+function applyRating(rev, rating, nowMs) {
+  const at = nowMs || Date.now();
+  const r = Object.assign({}, rev);
+  const inMin = m => new Date(at + m * 60000).toISOString();
+  const inDay = d => new Date(at + d * 86400000).toISOString();
+  const clampEf = e => Math.max(1.3, e);
+
+  if (r.state === 'new') { r.state = 'learning'; r.step = 0; }
+
+  if (r.state === 'learning' || r.state === 'relearning') {
+    const steps = r.state === 'learning' ? LEARN_STEPS_MIN : RELEARN_STEPS_MIN;
+    const graduate = easy => {
+      r.ivl = r.state === 'relearning'
+        ? Math.max(1, Math.round(r.ivl * 0.5)) + (easy ? 1 : 0)
+        : (easy ? 4 : 1);
+      r.state = 'review'; r.step = 0; r.due_at = inDay(r.ivl);
+    };
+    if (rating === 'again') { r.step = 0; r.due_at = inMin(steps[0]); }
+    else if (rating === 'hard') { r.due_at = inMin(Math.max(steps[Math.min(r.step, steps.length - 1)] * 1.5, 5)); }
+    else if (rating === 'good') {
+      r.step += 1;
+      if (r.step >= steps.length) graduate(false);
+      else r.due_at = inMin(steps[r.step]);
+    } else { graduate(true); }
+  } else {
+    if (rating === 'again') {
+      r.lapses += 1; r.ef = clampEf(r.ef - 0.2);
+      r.state = 'relearning'; r.step = 0; r.due_at = inMin(RELEARN_STEPS_MIN[0]);
+    } else if (rating === 'hard') {
+      r.ivl = Math.max(r.ivl + 1, Math.round(r.ivl * 1.2));
+      r.ef = clampEf(r.ef - 0.15); r.due_at = inDay(r.ivl);
+    } else if (rating === 'good') {
+      r.ivl = Math.max(r.ivl + 1, Math.round(r.ivl * r.ef)); r.due_at = inDay(r.ivl);
+    } else {
+      r.ivl = Math.max(r.ivl + 2, Math.round(r.ivl * r.ef * 1.3));
+      r.ef = clampEf(r.ef + 0.15); r.due_at = inDay(r.ivl);
+    }
+    r.ivl = Math.min(r.ivl, 36500);
+  }
+  r.reps += 1;
+  r.updated_at = new Date().toISOString();
+  return r;
+}
+
+function fmtDue(iso) {
+  const ms = new Date(iso) - Date.now();
+  const min = Math.round(ms / 60000);
+  if (min < 60) return Math.max(1, min) + 'm';
+  if (min < 60 * 36) return Math.round(min / 60) + 'h';
+  const d = Math.round(ms / 86400000);
+  if (d < 31) return d + 'd';
+  if (d < 365) return (Math.round(d / 30.4 * 10) / 10) + 'mo';
+  return (Math.round(d / 365 * 10) / 10) + 'y';
+}
+
+/* ---------- queue building ---------- */
+
+function allCards(sets) {
+  const out = [];
+  (sets || []).forEach(set => {
+    if (!set.data || !Array.isArray(set.data.sentences) || !set.data.sentences.length) return;
+    const n = set.data.sentences.length;
+    out.push({ cardId: set.id + '|reading|0', set: set, deck: 'reading', idx: 0 });
+    for (let i = 0; i < n; i++) out.push({ cardId: set.id + '|listening|' + i, set: set, deck: 'listening', idx: i });
+    for (let i = 0; i < n; i++) out.push({ cardId: set.id + '|speaking|' + i, set: set, deck: 'speaking', idx: i });
+  });
+  return out;
+}
+
+function dueCounts(sets, reviews, remainingNew) {
+  const now = Date.now();
+  const endOfDay = new Date(); endOfDay.setHours(23, 59, 59, 999);
+  let learn = 0, due = 0, freshTotal = 0;
+
+  allCards(sets).forEach(c => {
+    const r = reviews.get(c.cardId);
+    if (!r || r.state === 'new') freshTotal += 1;
+    else if (r.state === 'learning' || r.state === 'relearning') {
+      if (new Date(r.due_at) - now <= LEARN_AHEAD_MIN * 60000) learn += 1;
+    } else if (new Date(r.due_at) <= endOfDay) due += 1;
+  });
+
+  const fresh = Math.min(freshTotal, Math.max(0, remainingNew));
+  return { learn: learn, due: due, fresh: fresh, freshTotal: freshTotal, total: learn + due + fresh };
+}
+
+function nextDueAt(sets, reviews) {
+  let min = null;
+  const now = Date.now();
+  allCards(sets).forEach(c => {
+    const r = reviews.get(c.cardId);
+    if (!r || r.state === 'new') return;
+    const t = new Date(r.due_at);
+    if (t > now && (!min || t < min)) min = t;
+  });
+  return min;
+}
+
+function buildQueue(sets, reviews, remainingNew, learnerId, language) {
+  const now = Date.now();
+  const endOfDay = new Date(); endOfDay.setHours(23, 59, 59, 999);
+  const learn = [], rev = [], freshAll = [];
+
+  allCards(sets).forEach(c => {
+    const r = reviews.get(c.cardId) || null;
+    const item = Object.assign({}, c, {
+      rev: r || newRev(c.cardId, c.set.id, c.deck, c.idx, learnerId, language)
+    });
+    if (!r || r.state === 'new') freshAll.push(item);
+    else if (r.state === 'learning' || r.state === 'relearning') {
+      if (new Date(r.due_at) - now <= LEARN_AHEAD_MIN * 60000) learn.push(item);
+    } else if (new Date(r.due_at) <= endOfDay) rev.push(item);
+  });
+
+  const byDue = (a, b) => new Date(a.rev.due_at) - new Date(b.rev.due_at);
+  learn.sort(byDue);
+  rev.sort(byDue);
+  freshAll.sort((a, b) => new Date(a.set.created_at || 0) - new Date(b.set.created_at || 0));
+
+  return { learn: learn, rev: rev, fresh: freshAll.slice(0, Math.max(0, remainingNew)), done: 0 };
+}
+
+function pickNext(q) {
+  const now = Date.now();
+  const learnIdx = q.learn.findIndex(c => new Date(c.rev.due_at) <= now);
+  if (learnIdx >= 0) return q.learn.splice(learnIdx, 1)[0];
+  if (q.rev.length) return q.rev.shift();
+  if (q.fresh.length) return q.fresh.shift();
+  if (q.learn.length) return q.learn.shift();
+  return null;
+}
+
+/* ---------- forging a phrase into a card set ---------- */
+
+async function generateSentences(apiKey, phrase, nativeLang, targetLang) {
+  const sys = 'You generate language-learning example sentences. Respond with a single valid JSON object and nothing else. No markdown fences.';
+  const user = [
+    'Target language: ' + targetLang,
+    'Native language: ' + nativeLang,
+    'Target word or phrase: "' + phrase + '"',
+    '',
+    'Create EXACTLY ' + SENTENCES_PER_SET + ' sentences in ' + targetLang + ', each containing the target word or phrase ' +
+      '(inflected/conjugated forms are encouraged where natural). Keep sentences 6-18 words long.',
+    '',
+    'NATURALNESS — this is the top priority:',
+    '- Write the way native speakers ACTUALLY talk, not like a textbook. Prefer idiomatic, colloquial phrasing; ' +
+      'contractions and casual register are welcome where the language uses them.',
+    '- Ground each sentence in a realistic everyday situation (chatting with a friend, texting, at work, complaining, ' +
+      'telling a story, news, small talk). Vary tense, register, and context across the sentences.',
+    '- A native speaker reading the sentence should never think "nobody says it like that".',
+    '',
+    'SEPARABLE PHRASES:',
+    '- If the target phrase contains "..." it is separable: other words belong BETWEEN its parts. Use it naturally ' +
+      'with real words in between.',
+    '- In that case, word_form must return the parts as they actually appear in that sentence, joined by " ... ". ' +
+      'Each part must be copied verbatim from the sentence.',
+    '',
+    'Return JSON with this exact shape:',
+    '{',
+    '  "definition": "concise definition/explanation of the phrase in ' + nativeLang + ' (max 25 words)",',
+    '  "word_translation": "the closest single translation of just the word/phrase into ' + nativeLang + '",',
+    '  "sentences": [',
+    '    {',
+    '      "target": "the sentence in ' + targetLang + ', plain text, no HTML",',
+    '      "native": "faithful ' + nativeLang + ' translation, plain text",',
+    '      "word_form": "the EXACT substring of the target sentence that is the phrase as it appears there (verbatim, ' +
+      'including inflection); for separable phrases: the parts verbatim, joined by \' ... \'"',
+    '    }',
+    '  ]',
+    '}',
+    'The sentences array must have exactly ' + SENTENCES_PER_SET + ' items. word_form must be copy-pasted verbatim from its sentence.'
+  ].join('\n');
+
+  const raw = await chatCompletion(apiKey, [
+    { role: 'system', content: sys },
+    { role: 'user', content: user }
+  ], { json: true, temperature: 0.8, maxTokens: 2000 });
+
+  const cleaned = raw.replace(/^```(?:json)?/i, '').replace(/```$/, '').trim();
+  const parsed = JSON.parse(cleaned);
+  if (!Array.isArray(parsed.sentences) || !parsed.sentences.length) {
+    throw new Error('The model returned no sentences.');
+  }
+  parsed.sentences = parsed.sentences.slice(0, SENTENCES_PER_SET);
+  return parsed;
+}
+
+function base64FromArrayBuffer(buf) {
+  const bytes = new Uint8Array(buf);
+  let binary = '';
+  const CHUNK = 0x8000;
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
+  }
+  return btoa(binary);
+}
+
+/* ---------- Anki export (same three files as the original) ---------- */
+
+function deckName(language, suffix) {
+  return 'Fluent Loop::' + language + '::' + suffix;
+}
+
+function buildReadingDeck(sets, language) {
+  const name = deckName(language, 'Reading');
+  const rows = sets.map(set => stripField(readingFront(set)) + '\t' + stripField(readingBack(set)));
+  return {
+    filename: name.replace(/::/g, '-') + '.txt',
+    content: '#separator:tab\n#html:true\n#deck:' + name + '\n#columns:Front\tBack\n' + rows.join('\n')
+  };
+}
+
+function buildListeningDeck(sets, language) {
+  const name = deckName(language, 'Listening');
+  const rows = [];
+  sets.forEach(set => {
+    set.data.sentences.forEach((s, i) => {
+      const audio = (set.audio || [])[i] || '';
+      rows.push(stripField(listeningFront(audio)) + '\t' + stripField(listeningBack(set, s)));
+    });
+  });
+  return {
+    filename: name.replace(/::/g, '-') + '.txt',
+    content: '#separator:tab\n#html:true\n#deck:' + name + '\n#columns:Front\tBack\n' + rows.join('\n')
+  };
+}
+
+function buildSpeakingDeck(sets, language) {
+  const name = deckName(language, 'Speaking');
+  const rows = [];
+  sets.forEach(set => {
+    set.data.sentences.forEach((s, i) => {
+      const audio = (set.audio || [])[i] || '';
+      rows.push(stripField(speakingText(set, s)) + '\t' + stripField(speakingExtra(set, s, audio)));
+    });
+  });
+  return {
+    filename: name.replace(/::/g, '-') + '.txt',
+    content: '#separator:tab\n#html:true\n#notetype:Cloze\n#deck:' + name + '\n#columns:Text\tBack Extra\n' + rows.join('\n')
+  };
+}
+
 /* ------------------------------------------------------------------- UI bits */
 
 function Spinner({ className }) {
@@ -1334,6 +1757,44 @@ create index if not exists target_vocabulary_scope
 create index if not exists conversations_scope
   on public.conversations (user_id, target_language, created_at desc);
 
+-- Flashcards: one card set per phrase, plus SM-2 state and an append-only log.
+create table if not exists public.vocab_sets (
+  id uuid primary key default gen_random_uuid(),
+  user_id text not null default 'default_user',
+  target_language text not null default 'German',
+  vocab_id uuid references public.target_vocabulary(id) on delete cascade,
+  phrase text not null,
+  voice text,
+  data jsonb not null,
+  audio jsonb,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+create unique index if not exists vocab_sets_one_per_phrase
+  on public.vocab_sets (user_id, target_language, vocab_id);
+
+create table if not exists public.srs_reviews (
+  card_id text primary key,
+  user_id text not null default 'default_user',
+  target_language text not null default 'German',
+  set_id uuid not null references public.vocab_sets(id) on delete cascade,
+  deck text not null, idx int not null,
+  state text not null default 'new', step int not null default 0,
+  ivl int not null default 0, ef float8 not null default 2.5,
+  reps int not null default 0, lapses int not null default 0,
+  due_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+create table if not exists public.srs_revlog (
+  id uuid primary key default gen_random_uuid(),
+  user_id text not null default 'default_user',
+  target_language text, card_id text not null, set_id uuid, deck text,
+  rating text not null, state text, ivl int,
+  was_new boolean not null default false,
+  at timestamptz not null default now()
+);
+
 -- Upgrading an older database? The repo carries both migrations under
 -- supabase/migrations, so "supabase db push" applies them in order.`;
 
@@ -1382,6 +1843,241 @@ function VocabBar({ vocab, loading, onSuggest }) {
           </div>
         );
       })}
+    </div>
+  );
+}
+
+function CardFace({ html }) {
+  return <div className="srs-face" dangerouslySetInnerHTML={{ __html: html }} />;
+}
+
+function StudyOverlay({
+  sets, reviews, remainingNew, learnerId, language, onAnswer, onLoadAudio, onClose
+}) {
+  const [queue] = useState(() => buildQueue(sets, reviews, remainingNew, learnerId, language));
+  const [card, setCard] = useState(null);
+  const [audio, setAudio] = useState(null);
+  const [revealed, setRevealed] = useState(false);
+  const [done, setDone] = useState(0);
+  const [finished, setFinished] = useState(false);
+  const [loadingAudio, setLoadingAudio] = useState(false);
+  const audioCache = useRef(new Map());
+  const busyRef = useRef(false);
+
+  const advance = useCallback(async () => {
+    const next = pickNext(queue);
+    if (!next) { setCard(null); setFinished(true); return; }
+    setRevealed(false);
+    setCard(next);
+
+    if (next.deck === 'reading') { setAudio(null); return; }
+
+    const cached = audioCache.current.get(next.set.id);
+    if (cached) { setAudio(cached); return; }
+
+    setLoadingAudio(true);
+    setAudio(null);
+    try {
+      const rows = await onLoadAudio(next.set.id);
+      if (rows) audioCache.current.set(next.set.id, rows);
+      setAudio(rows || null);
+    } catch (err) {
+      console.error(err);
+      setAudio(null);
+    } finally {
+      setLoadingAudio(false);
+    }
+  }, [queue, onLoadAudio]);
+
+  useEffect(() => { advance(); }, []);
+
+  const rate = useCallback(async (rating) => {
+    if (!card || !revealed || busyRef.current) return;
+    busyRef.current = true;
+    const updated = await onAnswer(card, rating);
+    // A card still in a learning step comes back later in the same session.
+    if (updated && (updated.state === 'learning' || updated.state === 'relearning')) {
+      queue.learn.push(Object.assign({}, card, { rev: updated }));
+      queue.learn.sort((a, b) => new Date(a.rev.due_at) - new Date(b.rev.due_at));
+    }
+    setDone(d => d + 1);
+    busyRef.current = false;
+    advance();
+  }, [card, revealed, onAnswer, queue, advance]);
+
+  useEffect(() => {
+    function onKey(e) {
+      if (e.key === 'Escape') { onClose(); return; }
+      if (!card) return;
+      if (!revealed && (e.key === ' ' || e.key === 'Enter')) {
+        e.preventDefault();
+        setRevealed(true);
+        return;
+      }
+      if (revealed) {
+        const map = { '1': 'again', '2': 'hard', '3': 'good', '4': 'easy' };
+        if (map[e.key]) { e.preventDefault(); rate(map[e.key]); }
+        if (e.key === ' ' || e.key === 'Enter') { e.preventDefault(); rate('good'); }
+      }
+    }
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [card, revealed, rate, onClose]);
+
+  const remaining = card ? queue.learn.length + queue.rev.length + queue.fresh.length + 1 : 0;
+
+  let front = '', back = '';
+  if (card) {
+    const sentence = card.deck === 'reading' ? null : card.set.data.sentences[card.idx];
+    const clip = audio ? audio[card.idx] : '';
+    if (card.deck === 'reading') {
+      front = readingFront(card.set);
+      back = readingBack(card.set);
+    } else if (card.deck === 'listening') {
+      front = listeningFront(clip);
+      back = listeningBack(card.set, sentence);
+    } else {
+      const raw = speakingText(card.set, sentence);
+      front = raw.replace(/\{\{c1::([\s\S]*?)::([\s\S]*?)\}\}/g,
+        '<span style="background:#FFE45C;border-radius:4px;padding:0 .3em;color:#1E2A38;">[…$2…]</span>');
+      back = raw.replace(/\{\{c1::([\s\S]*?)::([\s\S]*?)\}\}/g, '$1') + speakingExtra(card.set, sentence, clip);
+    }
+  }
+
+  const RATINGS = [
+    { id: 'again', label: 'Again', key: '1', cls: 'bg-red-600 hover:bg-red-500' },
+    { id: 'hard',  label: 'Hard',  key: '2', cls: 'bg-amber-600 hover:bg-amber-500' },
+    { id: 'good',  label: 'Good',  key: '3', cls: 'bg-emerald-600 hover:bg-emerald-500' },
+    { id: 'easy',  label: 'Easy',  key: '4', cls: 'bg-sky-600 hover:bg-sky-500' }
+  ];
+
+  return (
+    <div className="fixed inset-0 z-50 flex flex-col bg-gray-900">
+      <header className="flex items-center justify-between border-b border-gray-800 px-5 py-3.5">
+        <button onClick={onClose} className="no-tap rounded-lg px-2 py-1 text-sm text-gray-400 transition hover:text-white">
+          Close
+        </button>
+        <div className="flex items-center gap-2 text-xs text-gray-400">
+          {card ? (
+            <span className="rounded px-2 py-0.5 font-semibold uppercase tracking-wide text-white"
+              style={{ background: 'linear-gradient(90deg,' + CARD_ACCENTS[card.deck][0] + ',' + CARD_ACCENTS[card.deck][1] + ')' }}>
+              {card.deck}
+            </span>
+          ) : null}
+          <span className="tabular-nums">{done} done{card ? ' · ' + remaining + ' left' : ''}</span>
+        </div>
+      </header>
+
+      <main className="flex-1 overflow-y-auto px-4 py-4">
+        <div className="mx-auto w-full max-w-md">
+          {finished ? (
+            <div className="py-16 text-center">
+              <div className="mb-3 text-4xl">🎉</div>
+              <h2 className="text-lg font-semibold">Queue cleared</h2>
+              <p className="mt-1 text-sm text-gray-400">
+                {done} card{done === 1 ? '' : 's'} reviewed. Learning cards come back in a few minutes.
+              </p>
+              <button onClick={onClose}
+                className="no-tap mt-6 rounded-xl bg-indigo-600 px-5 py-3 text-sm font-semibold text-white transition hover:bg-indigo-500">
+                Back to dashboard
+              </button>
+            </div>
+          ) : !card ? (
+            <div className="flex justify-center py-16 text-gray-500"><Spinner className="h-6 w-6" /></div>
+          ) : (
+            <React.Fragment>
+              {loadingAudio ? (
+                <div className="mb-2 flex items-center justify-center gap-2 text-xs text-gray-500">
+                  <Spinner className="h-3.5 w-3.5" /> Loading audio…
+                </div>
+              ) : null}
+              <CardFace html={front} />
+              {revealed ? <CardFace html={back} /> : null}
+            </React.Fragment>
+          )}
+        </div>
+      </main>
+
+      {card && !finished ? (
+        <footer className="safe-b border-t border-gray-800 px-4 pb-5 pt-4">
+          <div className="mx-auto w-full max-w-md">
+            {!revealed ? (
+              <button onClick={() => setRevealed(true)}
+                className="no-tap w-full rounded-xl bg-indigo-600 px-4 py-3.5 text-sm font-semibold text-white transition hover:bg-indigo-500">
+                Show answer <span className="ml-1 text-indigo-200/70">space</span>
+              </button>
+            ) : (
+              <div className="grid grid-cols-4 gap-2">
+                {RATINGS.map(r => (
+                  <button key={r.id} onClick={() => rate(r.id)}
+                    className={'no-tap rounded-xl px-2 py-3 text-white transition ' + r.cls}>
+                    <span className="block text-sm font-semibold">{r.label}</span>
+                    <span className="block text-[10px] opacity-80">{fmtDue(applyRating(card.rev, r.id).due_at)}</span>
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+        </footer>
+      ) : null}
+    </div>
+  );
+}
+
+function ForgeSheet({ pending, total, busy, progress, onForge, onClose }) {
+  return (
+    <div className="fixed inset-0 z-40 flex flex-col justify-end">
+      <div className="fade-in absolute inset-0 bg-black/60 backdrop-blur-sm" onClick={busy ? undefined : onClose} />
+      <div className="sheet-up relative flex max-h-[88vh] flex-col rounded-t-3xl border-t border-gray-700 bg-gray-900 shadow-2xl">
+        <div className="mx-auto mt-3 h-1.5 w-10 shrink-0 rounded-full bg-gray-700" />
+
+        <div className="mx-auto w-full max-w-md px-5 pt-4">
+          <div className="flex items-center justify-between">
+            <h2 className="text-lg font-semibold tracking-tight">Forge flashcards</h2>
+            <button onClick={onClose} disabled={busy}
+              className="no-tap rounded-lg p-1.5 text-gray-400 transition hover:text-white disabled:opacity-40" aria-label="Close">
+              <svg className="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+                <path d="M18 6 6 18M6 6l12 12" />
+              </svg>
+            </button>
+          </div>
+          <p className="mt-1 text-sm text-gray-400">
+            Each phrase becomes six natural example sentences with audio — 13 cards to study.
+          </p>
+        </div>
+
+        <div className="mx-auto w-full max-w-md flex-1 overflow-y-auto px-5 pb-4 pt-4">
+          {pending.length ? (
+            <div className="space-y-1.5">
+              {pending.map(v => (
+                <div key={v.id} className="truncate rounded-lg border border-gray-800 bg-gray-800/50 px-3 py-2 text-sm text-gray-200">
+                  {v.phrase}
+                </div>
+              ))}
+            </div>
+          ) : (
+            <p className="rounded-xl border border-dashed border-gray-700 bg-gray-800/30 p-4 text-sm text-gray-400">
+              Every saved phrase already has cards. Finish a session or add phrases to forge more.
+            </p>
+          )}
+
+          <div className="mt-3 flex min-h-[20px] items-center gap-2 text-xs text-gray-500">
+            {busy ? <Spinner className="h-3.5 w-3.5" /> : null}
+            <span className="truncate">{progress}</span>
+          </div>
+        </div>
+
+        <div className="safe-b mx-auto w-full max-w-md border-t border-gray-800 px-5 py-4">
+          <button onClick={onForge} disabled={busy || !pending.length}
+            className="no-tap flex w-full items-center justify-center gap-2 rounded-xl bg-indigo-600 px-4 py-3.5 text-sm font-semibold text-white transition hover:bg-indigo-500 disabled:opacity-50">
+            {busy ? <Spinner className="h-4 w-4" /> : null}
+            {busy ? 'Forging…' : pending.length ? 'Forge ' + pending.length + ' phrase' + (pending.length === 1 ? '' : 's') : 'Nothing to forge'}
+          </button>
+          <p className="mt-2 text-center text-[11px] text-gray-600">
+            Roughly a cent or two per phrase for the sentences and audio.
+          </p>
+        </div>
+      </div>
     </div>
   );
 }
@@ -1509,7 +2205,7 @@ function ProfileSheet({ learners, activeId, busy, onSwitch, onCreate, onDelete, 
   );
 }
 
-function StatsSheet({ stats, loading, language, learnerName, onClose }) {
+function StatsSheet({ stats, loading, language, learnerName, srs, onClose }) {
   const peak = stats ? Math.max(1, ...stats.series.map(d => d.minutes)) : 1;
 
   return (
@@ -1585,6 +2281,51 @@ function StatsSheet({ stats, loading, language, learnerName, onClose }) {
                   ))}
                 </div>
               </div>
+
+              {srs ? (
+                <div className="rounded-2xl border border-gray-800 bg-gray-800/40 p-4">
+                  <div className="mb-3 flex items-baseline justify-between">
+                    <span className="text-[11px] font-semibold uppercase tracking-wider text-gray-500">Flashcards</span>
+                    <span className="text-xs text-gray-500">
+                      {srs.reviewsToday} review{srs.reviewsToday === 1 ? '' : 's'} today
+                      {srs.reviewsToday ? ' · ' + srs.accuracyToday + '% recall' : ''}
+                    </span>
+                  </div>
+
+                  <div className="mb-3 flex h-2.5 w-full overflow-hidden rounded-full bg-gray-700">
+                    {[
+                      { key: 'fresh', cls: 'bg-gray-500' },
+                      { key: 'learning', cls: 'bg-amber-500' },
+                      { key: 'young', cls: 'bg-indigo-500' },
+                      { key: 'mature', cls: 'bg-emerald-500' }
+                    ].map(seg => (
+                      srs.maturity[seg.key] ? (
+                        <div key={seg.key} className={seg.cls}
+                          style={{ width: (srs.maturity[seg.key] / Math.max(1, srs.maturity.total) * 100) + '%' }}
+                          title={seg.key + ': ' + srs.maturity[seg.key]} />
+                      ) : null
+                    ))}
+                  </div>
+
+                  <div className="grid grid-cols-4 gap-2 text-center">
+                    {[
+                      { label: 'new', value: srs.maturity.fresh },
+                      { label: 'learning', value: srs.maturity.learning },
+                      { label: 'young', value: srs.maturity.young },
+                      { label: 'mature', value: srs.maturity.mature }
+                    ].map(cell => (
+                      <div key={cell.label}>
+                        <div className="text-sm font-semibold tabular-nums text-white">{cell.value}</div>
+                        <div className="text-[10px] uppercase tracking-wide text-gray-500">{cell.label}</div>
+                      </div>
+                    ))}
+                  </div>
+
+                  <div className="mt-3 border-t border-gray-700/60 pt-2.5 text-xs text-gray-500">
+                    {srs.sets} phrase{srs.sets === 1 ? '' : 's'} forged · {srs.totalReviews} review{srs.totalReviews === 1 ? '' : 's'} all time
+                  </div>
+                </div>
+              ) : null}
 
               <div>
                 <div className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-gray-500">All time</div>
@@ -1736,14 +2477,16 @@ function SuggestSheet({
   );
 }
 
-function ExportSheet({ vocab, targetLanguage, defaultTurkish, busy, note, onExport, onClose }) {
+function ExportSheet({ vocab, targetLanguage, defaultTurkish, busy, note, forgedCount, onExport, onClose }) {
   const [format, setFormat] = useState('csv');
   const [withTurkish, setWithTurkish] = useState(defaultTurkish);
 
   const formats = [
-    { id: 'csv', label: 'CSV', hint: 'Opens in Excel, Numbers, Sheets, Anki' },
-    { id: 'txt', label: 'Text', hint: 'Plain readable list' }
+    { id: 'csv', label: 'CSV', hint: 'Opens in Excel, Numbers, Sheets' },
+    { id: 'txt', label: 'Text', hint: 'Plain readable list' },
+    { id: 'anki', label: 'Anki decks', hint: forgedCount ? forgedCount + ' forged phrases · 3 files' : 'Forge cards first' }
   ];
+  const ankiOnly = format === 'anki';
 
   return (
     <div className="fixed inset-0 z-40 flex flex-col justify-end">
@@ -1769,9 +2512,10 @@ function ExportSheet({ vocab, targetLanguage, defaultTurkish, busy, note, onExpo
         <div className="mx-auto w-full max-w-md flex-1 overflow-y-auto px-5 pb-4 pt-4">
           <div className="mb-4">
             <span className="mb-1.5 block text-xs font-medium uppercase tracking-wider text-gray-400">File format</span>
-            <div className="grid grid-cols-2 gap-2">
+            <div className="grid grid-cols-3 gap-2">
               {formats.map(f => (
-                <button key={f.id} type="button" onClick={() => setFormat(f.id)} disabled={busy}
+                <button key={f.id} type="button" onClick={() => setFormat(f.id)}
+                  disabled={busy || (f.id === 'anki' && !forgedCount)}
                   className={'no-tap rounded-xl border p-3 text-left transition disabled:opacity-50 ' + (format === f.id
                     ? 'border-indigo-500 bg-indigo-500/15'
                     : 'border-gray-700 bg-gray-800 hover:border-gray-600')}>
@@ -1783,7 +2527,7 @@ function ExportSheet({ vocab, targetLanguage, defaultTurkish, busy, note, onExpo
           </div>
 
           <button type="button" onClick={() => setWithTurkish(!withTurkish)}
-            disabled={busy || targetLanguage === 'Turkish'}
+            disabled={busy || ankiOnly || targetLanguage === 'Turkish'}
             className={'no-tap flex w-full items-start gap-3 rounded-xl border p-3.5 text-left transition disabled:opacity-50 ' + (withTurkish
               ? 'border-indigo-500 bg-indigo-500/15'
               : 'border-gray-700 bg-gray-800 hover:border-gray-600')}>
@@ -1829,11 +2573,11 @@ function ExportSheet({ vocab, targetLanguage, defaultTurkish, busy, note, onExpo
         </div>
 
         <div className="safe-b mx-auto w-full max-w-md border-t border-gray-800 px-5 py-4">
-          <button onClick={() => onExport(format, withTurkish && targetLanguage !== 'Turkish')}
-            disabled={busy || !vocab.length}
+          <button onClick={() => onExport(format, withTurkish && !ankiOnly && targetLanguage !== 'Turkish')}
+            disabled={busy || (ankiOnly ? !forgedCount : !vocab.length)}
             className="no-tap flex w-full items-center justify-center gap-2 rounded-xl bg-indigo-600 px-4 py-3.5 text-sm font-semibold text-white transition hover:bg-indigo-500 disabled:opacity-50">
             {busy ? <Spinner className="h-4 w-4" /> : null}
-            {busy ? 'Preparing…' : 'Download .' + format}
+            {busy ? 'Preparing…' : ankiOnly ? 'Download 3 Anki decks' : 'Download .' + format}
           </button>
         </div>
       </div>
@@ -1845,7 +2589,8 @@ function Dashboard({
   profile, vocab, vocabLoading, recommendedTopic, recommendedSource,
   stats, onStart, onOpenSettings, onShowLastFeedback, hasLastFeedback, onExport,
   mode, onModeChange, onSuggest, language, onLanguageChange, switchingLanguage,
-  learner, learnerCount, onOpenProfiles, dailyStats, onOpenStats
+  learner, learnerCount, onOpenProfiles, dailyStats, onOpenStats,
+  srsCounts, srsLoading, unforgedCount, onStudy, onForge, newPerDay, onNewPerDayChange
 }) {
   const [custom, setCustom] = useState('');
   const chosen = custom.trim() || recommendedTopic;
@@ -1949,6 +2694,51 @@ function Dashboard({
           </div>
         </div>
         <VocabBar vocab={vocab} loading={vocabLoading} onSuggest={onSuggest} />
+      </section>
+
+      <section className="mb-7">
+        <div className="mb-2.5 flex items-baseline justify-between">
+          <h2 className="text-sm font-semibold text-gray-200">Flashcards</h2>
+          <div className="flex items-center gap-1.5 text-xs text-gray-500">
+            <span>new/day</span>
+            <input type="number" min="0" max="999" value={newPerDay}
+              onChange={e => onNewPerDayChange(e.target.value)}
+              className="w-14 rounded-md border border-gray-700 bg-gray-800 px-1.5 py-0.5 text-right text-xs text-gray-200 outline-none focus:border-indigo-500" />
+          </div>
+        </div>
+
+        <div className="rounded-2xl border border-gray-800 bg-gray-800/50 p-4">
+          {srsLoading ? (
+            <div className="flex items-center gap-2 text-sm text-gray-500"><Spinner className="h-4 w-4" /> Loading cards…</div>
+          ) : (
+            <React.Fragment>
+              <div className="flex items-end gap-4">
+                {[
+                  { label: 'due', value: srsCounts.due, tone: 'text-indigo-300' },
+                  { label: 'learning', value: srsCounts.learn, tone: 'text-amber-300' },
+                  { label: 'new', value: srsCounts.fresh, tone: 'text-emerald-300' }
+                ].map(cell => (
+                  <div key={cell.label}>
+                    <div className={'text-2xl font-semibold tabular-nums ' + cell.tone}>{cell.value}</div>
+                    <div className="text-[10px] uppercase tracking-wide text-gray-500">{cell.label}</div>
+                  </div>
+                ))}
+              </div>
+
+              <button onClick={onStudy} disabled={!srsCounts.total}
+                className="no-tap mt-3.5 w-full rounded-xl bg-amber-500 px-4 py-3 text-sm font-semibold text-gray-900 transition hover:bg-amber-400 disabled:opacity-40">
+                {srsCounts.total ? 'Study ' + srsCounts.total + ' card' + (srsCounts.total === 1 ? '' : 's') : 'Nothing due right now'}
+              </button>
+
+              {unforgedCount ? (
+                <button onClick={onForge}
+                  className="no-tap mt-2 w-full rounded-xl border border-dashed border-gray-700 px-4 py-2.5 text-xs font-medium text-gray-300 transition hover:border-gray-600 hover:text-white">
+                  Forge cards for {unforgedCount} saved phrase{unforgedCount === 1 ? '' : 's'}
+                </button>
+              ) : null}
+            </React.Fragment>
+          )}
+        </div>
       </section>
 
       <section className="mb-7">
@@ -2315,6 +3105,20 @@ function App() {
   });
   const [profilesOpen, setProfilesOpen] = useState(false);
   const [profilesBusy, setProfilesBusy] = useState(false);
+  const [srsSets, setSrsSets] = useState([]);
+  const [srsReviews, setSrsReviews] = useState(() => new Map());
+  const [srsIntroducedToday, setSrsIntroducedToday] = useState(0);
+  const [srsRevlog, setSrsRevlog] = useState([]);
+  const [srsLoading, setSrsLoading] = useState(false);
+  const [studyOpen, setStudyOpen] = useState(false);
+  const [forgeOpen, setForgeOpen] = useState(false);
+  const [forgeBusy, setForgeBusy] = useState(false);
+  const [forgeProgress, setForgeProgress] = useState('');
+  const [newPerDay, setNewPerDay] = useState(() => {
+    const cfg = loadConfig();
+    const n = cfg && cfg.newPerDay;
+    return Number.isFinite(n) ? n : DEFAULT_NEW_PER_DAY;
+  });
   const [statsOpen, setStatsOpen] = useState(false);
   const [statsLoading, setStatsLoading] = useState(false);
   const [dailyStats, setDailyStats] = useState(null);
@@ -2540,6 +3344,199 @@ function App() {
     refreshDailyStats();
   }, [refreshDailyStats]);
 
+  /* -------------------------------------------------------- spaced repetition */
+
+  // Card sets are fetched without their audio: the queue only needs the text,
+  // and six base64 mp3s per set would make the dashboard load enormous.
+  const refreshSrs = useCallback(async (c, languageOverride, learnerOverride) => {
+    const db = c || client;
+    const lang = languageOverride || languageRef.current;
+    const who = learnerOverride || learnerRef.current;
+    if (!db || !lang || !who) return;
+
+    setSrsLoading(true);
+    try {
+      const [setsRes, reviewsRes, logRes] = await Promise.all([
+        scoped(db.from('vocab_sets').select('id, vocab_id, phrase, data, created_at'), who, lang)
+          .order('created_at', { ascending: true }),
+        scoped(db.from('srs_reviews').select('*'), who, lang),
+        scoped(db.from('srs_revlog').select('card_id, rating, state, ivl, deck, was_new, at'), who, lang)
+          .order('at', { ascending: false })
+      ]);
+      if (setsRes.error) throw new Error(setsRes.error.message);
+      if (reviewsRes.error) throw new Error(reviewsRes.error.message);
+      if (logRes.error) throw new Error(logRes.error.message);
+
+      setSrsSets(setsRes.data || []);
+
+      const map = new Map();
+      (reviewsRes.data || []).forEach(r => map.set(r.card_id, r));
+      setSrsReviews(map);
+
+      const log = logRes.data || [];
+      setSrsRevlog(log);
+
+      const today = dayKey(new Date());
+      setSrsIntroducedToday(log.filter(r => r.was_new && dayKey(r.at) === today).length);
+    } catch (err) {
+      console.error(err);
+      if (missingSrsTables(err)) {
+        pushToast('error', 'The flashcard tables are missing. Run the SRS migration, then reload.');
+      } else {
+        pushToast('error', 'Could not load flashcards: ' + err.message);
+      }
+    } finally {
+      setSrsLoading(false);
+    }
+  }, [client, pushToast]);
+
+  const remainingNew = Math.max(0, newPerDay - srsIntroducedToday);
+
+  // Card maturity mirrors Anki's buckets: young is under 21 days, mature above.
+  const srsSummary = useMemo(() => {
+    const today = dayKey(new Date());
+    const todayLogs = srsRevlog.filter(r => dayKey(r.at) === today);
+    const again = todayLogs.filter(r => r.rating === 'again').length;
+    const maturity = { fresh: 0, learning: 0, young: 0, mature: 0, total: 0 };
+
+    allCards(srsSets).forEach(c => {
+      const r = srsReviews.get(c.cardId);
+      maturity.total += 1;
+      if (!r || r.state === 'new') maturity.fresh += 1;
+      else if (r.state === 'learning' || r.state === 'relearning') maturity.learning += 1;
+      else if ((r.ivl || 0) < 21) maturity.young += 1;
+      else maturity.mature += 1;
+    });
+
+    return {
+      reviewsToday: todayLogs.length,
+      accuracyToday: todayLogs.length ? Math.round((1 - again / todayLogs.length) * 100) : 0,
+      totalReviews: srsRevlog.length,
+      sets: srsSets.length,
+      maturity: maturity
+    };
+  }, [srsRevlog, srsSets, srsReviews]);
+  const srsCounts = useMemo(
+    () => dueCounts(srsSets, srsReviews, remainingNew),
+    [srsSets, srsReviews, remainingNew]
+  );
+
+  // Phrases that have no card set yet — the candidates for forging.
+  const unforged = useMemo(() => {
+    const done = new Set(srsSets.map(s => s.vocab_id).filter(Boolean));
+    return vocab.filter(v => !done.has(v.id));
+  }, [vocab, srsSets]);
+
+  const changeNewPerDay = useCallback((value) => {
+    const n = Math.max(0, Math.min(999, parseInt(value, 10) || 0));
+    setNewPerDay(n);
+    const cfg = loadConfig();
+    if (cfg) saveConfig(Object.assign({}, cfg, { newPerDay: n }));
+  }, []);
+
+  // Forge = generate six sentences, then one mp3 per sentence, then store both.
+  const forgePhrases = useCallback(async (rows) => {
+    if (!client || !rows.length) return;
+
+    setForgeBusy(true);
+    const lang = languageRef.current;
+    const who = learnerRef.current;
+    const voice = (config.voice || 'alloy');
+    let made = 0;
+    const failures = [];
+
+    try {
+      for (let i = 0; i < rows.length; i++) {
+        const row = rows[i];
+        const label = '(' + (i + 1) + '/' + rows.length + ') ' + row.phrase;
+        try {
+          setForgeProgress(label + ' — writing sentences…');
+          const data = await generateSentences(config.openaiKey, row.phrase, 'English', lang);
+
+          const audio = [];
+          for (let j = 0; j < data.sentences.length; j++) {
+            setForgeProgress(label + ' — recording audio (' + (j + 1) + '/' + data.sentences.length + ')…');
+            const blob = await synthesizeSpeech(config.openaiKey, data.sentences[j].target, voice);
+            audio.push(base64FromArrayBuffer(await blob.arrayBuffer()));
+          }
+
+          const ins = await client.from('vocab_sets').insert({
+            user_id: who,
+            target_language: lang,
+            vocab_id: row.id,
+            phrase: row.phrase,
+            voice: voice,
+            data: data,
+            audio: audio
+          });
+          if (ins.error) throw new Error(ins.error.message);
+          made += 1;
+        } catch (err) {
+          console.error('Forge failed for ' + row.phrase, err);
+          failures.push(row.phrase);
+        }
+      }
+
+      if (made) pushToast('success', 'Forged ' + made + ' phrase' + (made === 1 ? '' : 's') + ' into cards.');
+      if (failures.length) {
+        pushToast('error', 'Could not forge: ' + failures.slice(0, 3).join(', ') +
+          (failures.length > 3 ? ' and ' + (failures.length - 3) + ' more' : '') + '.');
+      }
+      await refreshSrs(client, lang, who);
+    } finally {
+      setForgeBusy(false);
+      setForgeProgress('');
+    }
+  }, [client, config, pushToast, refreshSrs]);
+
+  // Audio lives in its own column so the queue stays light; pull it per set.
+  const loadSetAudio = useCallback(async (setId) => {
+    if (!client) return null;
+    const res = await client.from('vocab_sets').select('audio').eq('id', setId).maybeSingle();
+    if (res.error) throw new Error(res.error.message);
+    return res.data ? res.data.audio : null;
+  }, [client]);
+
+  const recordAnswer = useCallback(async (card, rating) => {
+    if (!client) return null;
+    const wasNew = !card.rev || card.rev.state === 'new';
+    const updated = applyRating(card.rev, rating);
+    updated.user_id = learnerRef.current;
+    updated.target_language = languageRef.current;
+
+    setSrsReviews(prev => {
+      const next = new Map(prev);
+      next.set(updated.card_id, updated);
+      return next;
+    });
+    if (wasNew) setSrsIntroducedToday(n => n + 1);
+
+    try {
+      const up = await client.from('srs_reviews').upsert(updated, { onConflict: 'card_id' });
+      if (up.error) throw new Error(up.error.message);
+
+      const entry = {
+        user_id: learnerRef.current,
+        target_language: languageRef.current,
+        card_id: updated.card_id,
+        set_id: card.set.id,
+        deck: card.deck,
+        rating: rating,
+        state: updated.state,
+        ivl: updated.ivl,
+        was_new: wasNew,
+        at: new Date().toISOString()
+      };
+      const log = await client.from('srs_revlog').insert(entry);
+      if (log.error) throw new Error(log.error.message);
+      setSrsRevlog(prev => [entry].concat(prev));
+    } catch (err) {
+      console.error(err);
+      pushToast('error', 'Answer not saved: ' + err.message);
+    }
+    return updated;
+  }, [client, pushToast]);
+
   /* ------------------------------------------------------------ boot / init */
 
   useEffect(() => {
@@ -2577,7 +3574,8 @@ function App() {
         await Promise.all([
           refreshStats(db, activeLanguage, activeLearner),
           refreshRecommendedTopic(db, rows, activeLanguage, activeLearner),
-          refreshDailyStats(db, activeLanguage, activeLearner)
+          refreshDailyStats(db, activeLanguage, activeLearner),
+          refreshSrs(db, activeLanguage, activeLearner)
         ]);
       } catch (err) {
         if (cancelled) return;
@@ -3146,6 +4144,10 @@ function App() {
       setFeedback(null);
       setSheetOpen(false);
       setSuggestItems([]);
+      setSrsSets([]);
+      setSrsReviews(new Map());
+      setSrsRevlog([]);
+      setSrsIntroducedToday(0);
       turkishCacheRef.current = new Map();
 
       const cfg = loadConfig();
@@ -3156,7 +4158,8 @@ function App() {
       await Promise.all([
         refreshStats(client, lang, nextId),
         refreshRecommendedTopic(client, rows, lang, nextId),
-        refreshDailyStats(client, lang, nextId)
+        refreshDailyStats(client, lang, nextId),
+        refreshSrs(client, lang, nextId)
       ]);
       setProfilesOpen(false);
       const who = learners.find(l => l.id === nextId);
@@ -3252,6 +4255,10 @@ function App() {
       setFeedback(null);
       setSheetOpen(false);
       setSuggestItems([]);
+      setSrsSets([]);
+      setSrsReviews(new Map());
+      setSrsRevlog([]);
+      setSrsIntroducedToday(0);
       turkishCacheRef.current = new Map();
 
       const cfg = loadConfig();
@@ -3262,7 +4269,8 @@ function App() {
       await Promise.all([
         refreshStats(client, nextLanguage),
         refreshRecommendedTopic(client, rows, nextLanguage),
-        refreshDailyStats(client, nextLanguage)
+        refreshDailyStats(client, nextLanguage),
+        refreshSrs(client, nextLanguage)
       ]);
       pushToast('success', 'Switched to ' + nextLanguage + ' · ' + row.current_cefr + '.');
     } catch (err) {
@@ -3391,15 +4399,51 @@ function App() {
   /* --------------------------------------------------------- vocab export */
 
   const openExport = useCallback(() => {
-    if (!vocab.length) {
+    if (!vocab.length && !srsSets.length) {
       pushToast('info', 'No active phrases to export yet.');
       return;
     }
     setExportNote('');
     setExportOpen(true);
-  }, [vocab.length, pushToast]);
+  }, [vocab.length, srsSets.length, pushToast]);
 
   const runExport = useCallback(async (format, withTurkish) => {
+    // The Anki decks are built from forged card sets, not from the phrase list,
+    // and they need the audio column that the dashboard query leaves behind.
+    if (format === 'anki') {
+      setExportBusy(true);
+      setExportNote('Collecting sentences and audio…');
+      try {
+        const res = await scoped(
+          client.from('vocab_sets').select('id, phrase, data, audio, created_at'),
+          learnerRef.current, languageRef.current
+        ).order('created_at', { ascending: true });
+        if (res.error) throw new Error(res.error.message);
+
+        const sets = (res.data || []).filter(x => x.data && Array.isArray(x.data.sentences));
+        if (!sets.length) {
+          pushToast('info', 'No forged cards to export yet.');
+          return;
+        }
+
+        [buildReadingDeck(sets, profile.target_language),
+         buildListeningDeck(sets, profile.target_language),
+         buildSpeakingDeck(sets, profile.target_language)]
+          .forEach(deck => downloadFile(deck.filename, 'text/plain', deck.content));
+
+        setExportNote('Downloaded 3 deck files.');
+        pushToast('success', 'Exported 3 Anki decks from ' + sets.length + ' phrases.');
+        setExportOpen(false);
+      } catch (err) {
+        console.error(err);
+        setExportNote('');
+        pushToast('error', 'Anki export failed: ' + (err.message || String(err)));
+      } finally {
+        setExportBusy(false);
+      }
+      return;
+    }
+
     if (!vocab.length) return;
 
     setExportBusy(true);
@@ -3455,7 +4499,7 @@ function App() {
     } finally {
       setExportBusy(false);
     }
-  }, [vocab, config, profile, pushToast]);
+  }, [vocab, config, profile, client, pushToast]);
 
   /* ------------------------------------------------------------- settings */
 
@@ -3567,8 +4611,39 @@ function App() {
           onOpenProfiles={() => setProfilesOpen(true)}
           dailyStats={dailyStats}
           onOpenStats={openStats}
+          srsCounts={srsCounts}
+          srsLoading={srsLoading}
+          unforgedCount={unforged.length}
+          onStudy={() => setStudyOpen(true)}
+          onForge={() => setForgeOpen(true)}
+          newPerDay={newPerDay}
+          onNewPerDayChange={changeNewPerDay}
         />
       )}
+
+      {studyOpen && profile ? (
+        <StudyOverlay
+          sets={srsSets}
+          reviews={srsReviews}
+          remainingNew={remainingNew}
+          learnerId={learnerId}
+          language={language}
+          onAnswer={recordAnswer}
+          onLoadAudio={loadSetAudio}
+          onClose={() => { setStudyOpen(false); refreshDailyStats(); }}
+        />
+      ) : null}
+
+      {forgeOpen && profile ? (
+        <ForgeSheet
+          pending={unforged}
+          total={vocab.length}
+          busy={forgeBusy}
+          progress={forgeProgress}
+          onForge={() => forgePhrases(unforged)}
+          onClose={() => setForgeOpen(false)}
+        />
+      ) : null}
 
       {profilesOpen ? (
         <ProfileSheet
@@ -3588,6 +4663,7 @@ function App() {
           loading={statsLoading}
           language={profile.target_language}
           learnerName={activeLearner ? activeLearner.name : 'You'}
+          srs={srsSummary}
           onClose={() => setStatsOpen(false)}
         />
       ) : null}
@@ -3609,6 +4685,7 @@ function App() {
 
       {exportOpen && profile ? (
         <ExportSheet
+          forgedCount={srsSets.length}
           vocab={vocab}
           targetLanguage={profile.target_language}
           defaultTurkish={profile.target_language !== 'Turkish'}
