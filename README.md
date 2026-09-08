@@ -13,6 +13,7 @@ No build step, no bundler, no server. Open `index.html` and it runs: React 18, B
 - **Never corrects you mid-conversation.** Corrections arrive after the session, so the talking stays fluent.
 - **Turns your errors into a vocabulary list**, then works those phrases back into later sessions until you have actually used each one three times.
 - **Suggests phrases proactively** too, so you are not limited to fixing past mistakes.
+- **Keeps every language separate.** Your German level, vocabulary and history never touch your Spanish ones.
 - **Exports your vocabulary** as CSV or plain text, with Turkish translations.
 
 ---
@@ -26,15 +27,17 @@ Run this in the Supabase SQL editor (it is also shown inside the app on the setu
 ```sql
 create table if not exists public.profiles (
   id uuid primary key default gen_random_uuid(),
-  user_id text unique default 'default_user',
-  target_language text default 'German',
+  user_id text default 'default_user',
+  target_language text not null default 'German',
   current_cefr text default 'B1',
-  vocab_injection_mode text default 'adapt_naturally'
+  vocab_injection_mode text default 'adapt_naturally',
+  unique (user_id, target_language)
 );
 
 create table if not exists public.target_vocabulary (
   id uuid primary key default gen_random_uuid(),
   user_id text default 'default_user',
+  target_language text not null default 'German',
   phrase text not null,
   translation text,
   correction_context text,
@@ -46,13 +49,49 @@ create table if not exists public.target_vocabulary (
 create table if not exists public.conversations (
   id uuid primary key default gen_random_uuid(),
   user_id text default 'default_user',
+  target_language text not null default 'German',
   topic text not null,
   duration_seconds int,
   transcript jsonb not null,
   feedback jsonb,
   created_at timestamptz default now()
 );
+
+create index if not exists target_vocabulary_scope
+  on public.target_vocabulary (user_id, target_language, status);
+create index if not exists conversations_scope
+  on public.conversations (user_id, target_language, created_at desc);
 ```
+
+Every learner-owned row is keyed by **(user_id, target_language)**. See [Multiple languages](#multiple-languages).
+
+<details>
+<summary><strong>Upgrading from the single-language schema?</strong></summary>
+
+If you already have tables without a `target_language` column, run this instead. It backfills existing rows with the language from your old profile, so nothing is lost or misfiled.
+
+```sql
+alter table public.target_vocabulary add column if not exists target_language text;
+alter table public.conversations   add column if not exists target_language text;
+
+update public.target_vocabulary tv set target_language = p.target_language
+  from public.profiles p where p.user_id = tv.user_id and tv.target_language is null;
+update public.conversations c set target_language = p.target_language
+  from public.profiles p where p.user_id = c.user_id and c.target_language is null;
+
+update public.target_vocabulary set target_language = 'German' where target_language is null;
+update public.conversations   set target_language = 'German' where target_language is null;
+
+alter table public.target_vocabulary alter column target_language set not null;
+alter table public.conversations   alter column target_language set not null;
+
+alter table public.profiles drop constraint if exists profiles_user_id_key;
+alter table public.profiles add constraint profiles_user_language_key
+  unique (user_id, target_language);
+```
+
+The app detects the old schema and tells you to run this rather than failing obscurely.
+</details>
 
 The browser talks to Supabase directly with the **anon** key, so either leave RLS off on these three tables (fine for a single-user tool) or add policies that let `anon` read and write them:
 
@@ -82,12 +121,30 @@ On first run the app asks for:
 | OpenAI API key | Used for transcription, chat, speech and realtime |
 | Supabase URL | `https://xxxx.supabase.co` |
 | Supabase anon key | The public anon key, not the service role key |
-| Target language | 15 options, from German to Mandarin |
+| Target language | 15 options, from German to Mandarin — each gets its own workspace |
 | CEFR level | A1 through C2 |
 | Vocab injection mode | Adapt Naturally or Force Verbatim |
 | Partner voice | Voice used for the spoken replies |
 
 **Test & Save** verifies the OpenAI key, probes the Supabase tables and writes your profile before letting you through. Everything is stored under the `fluentloop.config.v1` key in `localStorage` — nothing is sent anywhere else.
+
+---
+
+## Multiple languages
+
+Each target language is a **separate workspace**. Switching language switches everything with it:
+
+| Scoped per language | Meaning |
+| --- | --- |
+| CEFR level | You can be B2 in German and A1 in Spanish at the same time |
+| Injection mode | Adapt Naturally for one language, Force Verbatim for another |
+| Vocabulary | German phrases never appear in a Spanish session |
+| Session history | Stats and the recommended next topic come only from that language |
+| Exports | A CSV contains one language, and the filename says which |
+
+Use the dropdown in the dashboard header to switch. Picking a language you have never studied creates its profile automatically at B1, with an empty vocabulary list. The active language is remembered in `localStorage`, so the app reopens where you left off.
+
+Under the hood every row carries `target_language`, and every read and write is filtered by `(user_id, target_language)`. The language a session ran in is pinned when the session ends, so switching mid-analysis cannot misfile the results.
 
 ---
 
@@ -178,7 +235,7 @@ Adapt Naturally sounds like a real conversation. Force Verbatim is better when y
 
 ## Limitations
 
-- Single user. Every row is written against `user_id = 'default_user'`; there is no auth.
+- Single user. Every row is written against `user_id = 'default_user'`; there is no auth. Languages are separated, users are not.
 - Your API key sits in the browser. Fine for personal use on your own machine, not for a shared deployment.
 - Duplicate phrases are caught by exact normalized match, so a near-variant of an existing phrase can still be saved as its own row.
 - The Tailwind and Babel CDN builds print production warnings in the console. Harmless here, but this is not a production deployment pattern.

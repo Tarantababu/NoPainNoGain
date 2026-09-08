@@ -80,19 +80,24 @@
 /* ============================================================================
    FLUENT LOOP — single-file voice language coach
    ----------------------------------------------------------------------------
-   Required Supabase schema (run this SQL once in the Supabase SQL editor):
+   Required Supabase schema (run this SQL once in the Supabase SQL editor).
+   Every learner-owned row is scoped to (user_id, target_language), so each
+   target language is a separate workspace: its own level, its own vocabulary,
+   its own session history. Nothing leaks between languages.
 
    create table if not exists public.profiles (
      id uuid primary key default gen_random_uuid(),
-     user_id text unique default 'default_user',
-     target_language text default 'German',
+     user_id text default 'default_user',
+     target_language text not null default 'German',
      current_cefr text default 'B1',
-     vocab_injection_mode text default 'adapt_naturally' -- 'adapt_naturally' | 'force_verbatim'
+     vocab_injection_mode text default 'adapt_naturally', -- 'adapt_naturally' | 'force_verbatim'
+     unique (user_id, target_language)
    );
 
    create table if not exists public.target_vocabulary (
      id uuid primary key default gen_random_uuid(),
      user_id text default 'default_user',
+     target_language text not null default 'German',
      phrase text not null,
      translation text,
      correction_context text,
@@ -104,6 +109,7 @@
    create table if not exists public.conversations (
      id uuid primary key default gen_random_uuid(),
      user_id text default 'default_user',
+     target_language text not null default 'German',
      topic text not null,
      duration_seconds int,
      transcript jsonb not null,
@@ -111,13 +117,16 @@
      created_at timestamp with time zone default now()
    );
 
-   -- This app talks to Supabase directly from the browser with the anon key,
-   -- so either keep RLS off for these tables (single-user/local use) or add
-   -- policies that allow anon read/write:
-   --
-   -- alter table public.profiles enable row level security;
-   -- create policy "anon all" on public.profiles for all to anon using (true) with check (true);
-   -- (repeat for target_vocabulary and conversations)
+   Upgrading from the single-language schema? The setup screen carries the
+   migration, which backfills existing rows from your old profile row.
+
+   This app talks to Supabase directly from the browser with the anon key,
+   so either keep RLS off for these tables (single-user/local use) or add
+   policies that allow anon read/write:
+
+   alter table public.profiles enable row level security;
+   create policy "anon all" on public.profiles for all to anon using (true) with check (true);
+   (repeat for target_vocabulary and conversations)
    ========================================================================== */
 
 const { useState, useEffect, useRef, useCallback, useMemo } = React;
@@ -125,6 +134,22 @@ const { useState, useEffect, useRef, useCallback, useMemo } = React;
 /* ---------------------------------------------------------------- constants */
 
 const DEFAULT_USER = 'default_user';
+
+// Every learner-owned row is scoped to (user_id, target_language) so that
+// switching language switches to a completely separate vocabulary, history and
+// level. Nothing crosses between languages.
+function scoped(query, language) {
+  return query.eq('user_id', DEFAULT_USER).eq('target_language', language);
+}
+
+function missingLanguageColumn(error) {
+  const msg = (error && error.message ? error.message : String(error || '')).toLowerCase();
+  return msg.indexOf('target_language') !== -1 &&
+    (msg.indexOf('does not exist') !== -1 || msg.indexOf('column') !== -1 || msg.indexOf('schema cache') !== -1);
+}
+
+const MIGRATION_HINT = 'Your database is still on the single-language schema. ' +
+  'Run the per-language migration shown on the setup screen, then reload.';
 const SESSION_SECONDS = 30 * 60;
 const MASTERY_THRESHOLD = 3;
 const CONFIG_KEY = 'fluentloop.config.v1';
@@ -257,6 +282,33 @@ function extensionForMime(mime) {
   if (mime.includes('mpeg')) return 'mp3';
   if (mime.includes('wav')) return 'wav';
   return 'webm';
+}
+
+
+// One profile row per language: your German level and your Spanish level are
+// independent of each other.
+async function loadOrCreateProfile(db, language, defaults) {
+  const existing = await db
+    .from('profiles')
+    .select('*')
+    .eq('user_id', DEFAULT_USER)
+    .eq('target_language', language)
+    .maybeSingle();
+  if (existing.error) throw new Error('Supabase: ' + existing.error.message);
+  if (existing.data) return existing.data;
+
+  const ins = await db
+    .from('profiles')
+    .insert({
+      user_id: DEFAULT_USER,
+      target_language: language,
+      current_cefr: (defaults && defaults.current_cefr) || 'B1',
+      vocab_injection_mode: (defaults && defaults.vocab_injection_mode) || 'adapt_naturally'
+    })
+    .select()
+    .single();
+  if (ins.error) throw new Error('Supabase: ' + ins.error.message);
+  return ins.data;
 }
 
 /* -------------------------------------------------------------- OpenAI calls */
@@ -903,11 +955,20 @@ function SetupScreen({ initial, onSaved, onCancel, pushToast }) {
         throw new Error('Supabase: ' + probe.error.message + ' (check the URL, the anon key, that the tables exist, and that RLS allows anon access)');
       }
 
-      setStep('Saving your profile…');
+      setStep('Checking the per-language schema…');
+      const langProbe = await client.from('target_vocabulary').select('target_language').limit(1);
+      if (langProbe.error) {
+        if (missingLanguageColumn(langProbe.error)) throw new Error(MIGRATION_HINT);
+        throw new Error('Supabase: ' + langProbe.error.message);
+      }
+
+      setStep('Saving your ' + language + ' profile…');
+      // Settings only ever touch the profile row for the language being saved.
       const existing = await client
         .from('profiles')
         .select('*')
         .eq('user_id', DEFAULT_USER)
+        .eq('target_language', language)
         .maybeSingle();
       if (existing.error) throw new Error('Supabase: ' + existing.error.message);
 
@@ -923,7 +984,7 @@ function SetupScreen({ initial, onSaved, onCancel, pushToast }) {
         const upd = await client
           .from('profiles')
           .update(profileRow)
-          .eq('user_id', DEFAULT_USER)
+          .eq('id', existing.data.id)
           .select()
           .single();
         if (upd.error) throw new Error('Supabase: ' + upd.error.message);
@@ -938,7 +999,12 @@ function SetupScreen({ initial, onSaved, onCancel, pushToast }) {
         saved = ins.data;
       }
 
-      const cfg = { openaiKey: key, supabaseUrl: url, supabaseKey: anon, voice: voice };
+      const prevCfg = loadConfig() || {};
+      const cfg = {
+        openaiKey: key, supabaseUrl: url, supabaseKey: anon, voice: voice,
+        targetLanguage: language,
+        conversationMode: prevCfg.conversationMode || MODE_TURN
+      };
       saveConfig(cfg);
       pushToast('success', 'Connected. Everything checks out.');
       onSaved(cfg, client, saved);
@@ -1043,17 +1109,20 @@ function SetupScreen({ initial, onSaved, onCancel, pushToast }) {
   );
 }
 
-const SQL_SNIPPET = `create table if not exists public.profiles (
+const SQL_SNIPPET = `-- New install: everything is scoped to (user_id, target_language)
+create table if not exists public.profiles (
   id uuid primary key default gen_random_uuid(),
-  user_id text unique default 'default_user',
-  target_language text default 'German',
+  user_id text default 'default_user',
+  target_language text not null default 'German',
   current_cefr text default 'B1',
-  vocab_injection_mode text default 'adapt_naturally'
+  vocab_injection_mode text default 'adapt_naturally',
+  unique (user_id, target_language)
 );
 
 create table if not exists public.target_vocabulary (
   id uuid primary key default gen_random_uuid(),
   user_id text default 'default_user',
+  target_language text not null default 'German',
   phrase text not null,
   translation text,
   correction_context text,
@@ -1065,12 +1134,39 @@ create table if not exists public.target_vocabulary (
 create table if not exists public.conversations (
   id uuid primary key default gen_random_uuid(),
   user_id text default 'default_user',
+  target_language text not null default 'German',
   topic text not null,
   duration_seconds int,
   transcript jsonb not null,
   feedback jsonb,
   created_at timestamptz default now()
-);`;
+);
+
+create index if not exists target_vocabulary_scope
+  on public.target_vocabulary (user_id, target_language, status);
+create index if not exists conversations_scope
+  on public.conversations (user_id, target_language, created_at desc);
+
+-- Already have the single-language tables? Run this migration instead.
+-- It backfills existing rows with the language from your old profile.
+--
+-- alter table public.target_vocabulary add column if not exists target_language text;
+-- alter table public.conversations   add column if not exists target_language text;
+--
+-- update public.target_vocabulary tv set target_language = p.target_language
+--   from public.profiles p where p.user_id = tv.user_id and tv.target_language is null;
+-- update public.conversations c set target_language = p.target_language
+--   from public.profiles p where p.user_id = c.user_id and c.target_language is null;
+--
+-- update public.target_vocabulary set target_language = 'German' where target_language is null;
+-- update public.conversations   set target_language = 'German' where target_language is null;
+--
+-- alter table public.target_vocabulary alter column target_language set not null;
+-- alter table public.conversations   alter column target_language set not null;
+--
+-- alter table public.profiles drop constraint if exists profiles_user_id_key;
+-- alter table public.profiles add constraint profiles_user_language_key
+--   unique (user_id, target_language);`;
 
 /* ---------------------------------------------------------------- dashboard */
 
@@ -1353,7 +1449,7 @@ function ExportSheet({ vocab, targetLanguage, defaultTurkish, busy, note, onExpo
 function Dashboard({
   profile, vocab, vocabLoading, recommendedTopic, recommendedSource,
   stats, onStart, onOpenSettings, onShowLastFeedback, hasLastFeedback, onExport,
-  mode, onModeChange, onSuggest
+  mode, onModeChange, onSuggest, language, onLanguageChange, switchingLanguage
 }) {
   const [custom, setCustom] = useState('');
   const chosen = custom.trim() || recommendedTopic;
@@ -1362,12 +1458,25 @@ function Dashboard({
     <div className="mx-auto flex min-h-full w-full max-w-md flex-col px-5 pb-28 pt-8">
       <header className="mb-7 flex items-start justify-between">
         <div>
-          <div className="text-xs font-medium uppercase tracking-wider text-indigo-400">
-            {profile.target_language} · {profile.current_cefr}
+          <div className="flex items-center gap-2">
+            <div className="relative">
+              <select value={language} disabled={switchingLanguage}
+                onChange={e => onLanguageChange(e.target.value)}
+                className="no-tap appearance-none rounded-lg border border-gray-700 bg-gray-800 py-1 pl-2.5 pr-7 text-xs font-medium uppercase tracking-wider text-indigo-300 outline-none transition hover:border-gray-600 focus:border-indigo-500 disabled:opacity-50"
+                aria-label="Target language">
+                {LANGUAGES.map(l => <option key={l.code} value={l.name}>{l.name}</option>)}
+              </select>
+              <svg className="pointer-events-none absolute right-2 top-1/2 h-3 w-3 -translate-y-1/2 text-gray-500"
+                viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                <path d="m6 9 6 6 6-6" />
+              </svg>
+            </div>
+            <span className="text-xs font-medium uppercase tracking-wider text-gray-500">{profile.current_cefr}</span>
+            {switchingLanguage ? <Spinner className="h-3.5 w-3.5 text-gray-500" /> : null}
           </div>
-          <h1 className="mt-1 text-2xl font-semibold tracking-tight">Today's session</h1>
+          <h1 className="mt-1.5 text-2xl font-semibold tracking-tight">Today's session</h1>
           <p className="mt-1 text-sm text-gray-400">
-            {stats.sessions} session{stats.sessions === 1 ? '' : 's'} done · {stats.mastered} phrase{stats.mastered === 1 ? '' : 's'} mastered
+            {stats.sessions} {profile.target_language} session{stats.sessions === 1 ? '' : 's'} done · {stats.mastered} phrase{stats.mastered === 1 ? '' : 's'} mastered
           </p>
         </div>
         <button onClick={onOpenSettings}
@@ -1761,6 +1870,11 @@ function App() {
   const [config, setConfig] = useState(loadConfig);
   const [client, setClient] = useState(null);
   const [profile, setProfile] = useState(null);
+  const [language, setLanguage] = useState(() => {
+    const cfg = loadConfig();
+    return (cfg && cfg.targetLanguage) || 'German';
+  });
+  const [switchingLanguage, setSwitchingLanguage] = useState(false);
   const [screen, setScreen] = useState(loadConfig() ? 'loading' : 'setup');
   const [toast, setToast] = useState(null);
 
@@ -1808,10 +1922,12 @@ function App() {
   const realtimeDcRef = useRef(null);
   const realtimeItemsRef = useRef([]);
   const modeRef = useRef(MODE_TURN);
+  const languageRef = useRef('German');
 
   useEffect(() => { messagesRef.current = messages; }, [messages]);
   useEffect(() => { statusRef.current = status; }, [status]);
   useEffect(() => { modeRef.current = mode; }, [mode]);
+  useEffect(() => { languageRef.current = language; }, [language]);
 
   const changeMode = useCallback((next) => {
     setMode(next);
@@ -1870,18 +1986,16 @@ function App() {
 
   /* --------------------------------------------------------- data fetching */
 
-  const refreshVocab = useCallback(async (c) => {
+  const refreshVocab = useCallback(async (c, languageOverride) => {
     const db = c || client;
-    if (!db) return [];
+    const lang = languageOverride || languageRef.current;
+    if (!db || !lang) return [];
     setVocabLoading(true);
     try {
-      const res = await db
-        .from('target_vocabulary')
-        .select('*')
-        .eq('user_id', DEFAULT_USER)
+      const res = await scoped(db.from('target_vocabulary').select('*'), lang)
         .eq('status', 'learning')
         .order('created_at', { ascending: true });
-      if (res.error) throw new Error(res.error.message);
+      if (res.error) throw new Error(missingLanguageColumn(res.error) ? MIGRATION_HINT : res.error.message);
       const rows = res.data || [];
       setVocab(rows);
       return rows;
@@ -1893,13 +2007,14 @@ function App() {
     }
   }, [client, pushToast]);
 
-  const refreshStats = useCallback(async (c) => {
+  const refreshStats = useCallback(async (c, languageOverride) => {
     const db = c || client;
-    if (!db) return;
+    const lang = languageOverride || languageRef.current;
+    if (!db || !lang) return;
     try {
       const [sessionsRes, masteredRes] = await Promise.all([
-        db.from('conversations').select('id', { count: 'exact', head: true }).eq('user_id', DEFAULT_USER),
-        db.from('target_vocabulary').select('id', { count: 'exact', head: true }).eq('user_id', DEFAULT_USER).eq('status', 'mastered')
+        scoped(db.from('conversations').select('id', { count: 'exact', head: true }), lang),
+        scoped(db.from('target_vocabulary').select('id', { count: 'exact', head: true }), lang).eq('status', 'mastered')
       ]);
       setStats({
         sessions: sessionsRes.count || 0,
@@ -1910,14 +2025,12 @@ function App() {
     }
   }, [client]);
 
-  const refreshRecommendedTopic = useCallback(async (c, vocabRows) => {
+  const refreshRecommendedTopic = useCallback(async (c, vocabRows, languageOverride) => {
     const db = c || client;
-    if (!db) return;
+    const lang = languageOverride || languageRef.current;
+    if (!db || !lang) return;
     try {
-      const res = await db
-        .from('conversations')
-        .select('feedback, topic, created_at')
-        .eq('user_id', DEFAULT_USER)
+      const res = await scoped(db.from('conversations').select('feedback, topic, created_at'), lang)
         .order('created_at', { ascending: false })
         .limit(1);
       if (res.error) throw new Error(res.error.message);
@@ -1962,26 +2075,27 @@ function App() {
         if (cancelled) return;
         setClient(db);
 
-        const prof = await db.from('profiles').select('*').eq('user_id', DEFAULT_USER).maybeSingle();
-        if (prof.error) throw new Error(prof.error.message);
+        const activeLanguage = cfg.targetLanguage || 'German';
+        languageRef.current = activeLanguage;
+        setLanguage(activeLanguage);
 
-        let row = prof.data;
-        if (!row) {
-          const ins = await db.from('profiles').insert({ user_id: DEFAULT_USER }).select().single();
-          if (ins.error) throw new Error(ins.error.message);
-          row = ins.data;
-        }
+        const row = await loadOrCreateProfile(db, activeLanguage, null);
         if (cancelled) return;
         setProfile(row);
         setScreen('dashboard');
 
-        const rows = await refreshVocab(db);
+        const rows = await refreshVocab(db, activeLanguage);
         if (cancelled) return;
-        await Promise.all([refreshStats(db), refreshRecommendedTopic(db, rows)]);
+        await Promise.all([
+          refreshStats(db, activeLanguage),
+          refreshRecommendedTopic(db, rows, activeLanguage)
+        ]);
       } catch (err) {
         if (cancelled) return;
         console.error(err);
-        pushToast('error', 'Connection failed: ' + err.message + ' — check your settings.');
+        pushToast('error', missingLanguageColumn(err)
+          ? MIGRATION_HINT
+          : 'Connection failed: ' + err.message + ' — check your settings.');
         setScreen('setup');
       }
     }
@@ -2363,6 +2477,8 @@ function App() {
     const transcript = messagesRef.current.slice();
     const usedSeconds = SESSION_SECONDS - secondsLeft;
     const sessionTopic = topic;
+    // Pin the language at end time so a mid-analysis switch cannot misfile rows.
+    const sessionLanguage = languageRef.current;
     const sessionVocab = sessionVocabRef.current.slice();
 
     const userTurns = transcript.filter(m => m.role === 'user');
@@ -2432,10 +2548,7 @@ function App() {
     // 1. Insert newly recommended phrases (skip ones already tracked).
     try {
       if (analysis.recommended_phrases.length && client) {
-        const existing = await client
-          .from('target_vocabulary')
-          .select('phrase')
-          .eq('user_id', DEFAULT_USER);
+        const existing = await scoped(client.from('target_vocabulary').select('phrase'), sessionLanguage);
         if (existing.error) throw new Error(existing.error.message);
 
         const known = new Set((existing.data || []).map(r => normalizeText(r.phrase)));
@@ -2443,6 +2556,7 @@ function App() {
           .filter(p => p && p.phrase && !known.has(normalizeText(p.phrase)))
           .map(p => ({
             user_id: DEFAULT_USER,
+            target_language: sessionLanguage,
             phrase: String(p.phrase).trim(),
             translation: p.translation ? String(p.translation).trim() : null,
             correction_context: p.context ? String(p.context).trim() : null,
@@ -2481,6 +2595,7 @@ function App() {
       if (client) {
         const ins = await client.from('conversations').insert({
           user_id: DEFAULT_USER,
+          target_language: sessionLanguage,
           topic: sessionTopic,
           duration_seconds: usedSeconds,
           transcript: transcript,
@@ -2505,19 +2620,57 @@ function App() {
       setSaveNote('Saved' + (bits.length ? ' · ' + bits.join(' · ') : '') + '.');
     }
 
-    const rows = await refreshVocab(client);
-    await Promise.all([refreshStats(client), refreshRecommendedTopic(client, rows)]);
+    const rows = await refreshVocab(client, sessionLanguage);
+    await Promise.all([
+      refreshStats(client, sessionLanguage),
+      refreshRecommendedTopic(client, rows, sessionLanguage)
+    ]);
     endingRef.current = false;
   }, [client, config, profile, topic, secondsLeft, releaseMic, stopPlayback, teardownRealtime, pushToast, refreshVocab, refreshStats, refreshRecommendedTopic]);
+
+  /* -------------------------------------------------------- language switch */
+
+  // Switching language swaps the entire workspace: its own profile row, its own
+  // vocabulary, its own history. Nothing is carried across.
+  const switchLanguage = useCallback(async (nextLanguage) => {
+    if (!client || !nextLanguage || nextLanguage === language) return;
+
+    setSwitchingLanguage(true);
+    try {
+      const row = await loadOrCreateProfile(client, nextLanguage, null);
+
+      languageRef.current = nextLanguage;
+      setLanguage(nextLanguage);
+      setProfile(row);
+      setVocab([]);
+      setFeedback(null);
+      setSheetOpen(false);
+      setSuggestItems([]);
+      turkishCacheRef.current = new Map();
+
+      const cfg = loadConfig();
+      if (cfg) saveConfig(Object.assign({}, cfg, { targetLanguage: nextLanguage }));
+      setConfig(loadConfig());
+
+      const rows = await refreshVocab(client, nextLanguage);
+      await Promise.all([
+        refreshStats(client, nextLanguage),
+        refreshRecommendedTopic(client, rows, nextLanguage)
+      ]);
+      pushToast('success', 'Switched to ' + nextLanguage + ' · ' + row.current_cefr + '.');
+    } catch (err) {
+      console.error(err);
+      pushToast('error', missingLanguageColumn(err) ? MIGRATION_HINT : 'Could not switch language: ' + err.message);
+    } finally {
+      setSwitchingLanguage(false);
+    }
+  }, [client, language, refreshVocab, refreshStats, refreshRecommendedTopic, pushToast]);
 
   /* ---------------------------------------------------- phrase suggestions */
 
   const fetchKnownPhrases = useCallback(async () => {
     if (!client) return [];
-    const res = await client
-      .from('target_vocabulary')
-      .select('phrase')
-      .eq('user_id', DEFAULT_USER);
+    const res = await scoped(client.from('target_vocabulary').select('phrase'), languageRef.current);
     if (res.error) throw new Error(res.error.message);
     return (res.data || []).map(r => r.phrase).filter(Boolean);
   }, [client]);
@@ -2591,6 +2744,7 @@ function App() {
         .filter(it => !knownKeys.has(normalizeText(it.phrase)))
         .map(it => ({
           user_id: DEFAULT_USER,
+          target_language: languageRef.current,
           phrase: it.phrase,
           translation: it.translation || null,
           correction_context: it.context || null,
@@ -2699,12 +2853,15 @@ function App() {
   /* ------------------------------------------------------------- settings */
 
   const handleSetupSaved = useCallback(async (cfg, db, savedProfile) => {
+    const lang = savedProfile.target_language;
+    languageRef.current = lang;
+    setLanguage(lang);
     setConfig(cfg);
     setClient(db);
     setProfile(savedProfile);
     setScreen('dashboard');
-    const rows = await refreshVocab(db);
-    await Promise.all([refreshStats(db), refreshRecommendedTopic(db, rows)]);
+    const rows = await refreshVocab(db, lang);
+    await Promise.all([refreshStats(db, lang), refreshRecommendedTopic(db, rows, lang)]);
   }, [refreshVocab, refreshStats, refreshRecommendedTopic]);
 
   /* ---------------------------------------------------------------- render */
@@ -2723,7 +2880,7 @@ function App() {
       supabaseUrl: config ? config.supabaseUrl : '',
       supabaseKey: config ? config.supabaseKey : '',
       voice: config && config.voice ? config.voice : 'alloy',
-      target_language: profile ? profile.target_language : 'German',
+      target_language: profile ? profile.target_language : language,
       current_cefr: profile ? profile.current_cefr : 'B1',
       vocab_injection_mode: profile ? profile.vocab_injection_mode : 'adapt_naturally'
     };
@@ -2783,6 +2940,9 @@ function App() {
           mode={mode}
           onModeChange={changeMode}
           onSuggest={openSuggest}
+          language={language}
+          onLanguageChange={switchLanguage}
+          switchingLanguage={switchingLanguage}
         />
       )}
 
