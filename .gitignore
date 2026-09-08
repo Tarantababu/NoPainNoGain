@@ -2,6 +2,5 @@
 supabase/.temp/
 supabase/.branches/
 
-# Source material for the SRS merge, not part of the app
-files/
+# Upload artifact of files/ — the folder itself is committed
 files.zip

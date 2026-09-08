@@ -1,0 +1,1817 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<title>Wordstack — flashcard forge + SRS</title>
+<link rel="manifest" href="manifest.webmanifest">
+<meta name="theme-color" content="#1E2A38">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="Wordstack">
+<link rel="apple-touch-icon" href="icon-192.png">
+<link rel="icon" href="icon-192.png">
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js"></script>
+<script>
+  window.tailwind = window.tailwind || {};
+  tailwind.config = {
+    theme: {
+      extend: {
+        colors: {
+          ink: '#1E2A38',
+          inkfaint: '#5C6B7A',
+          paper: '#F5F6F3',
+          card: '#FFFFFF',
+          mark: '#FFE45C',
+          markdeep: '#F5C400',
+          action: '#2B59C3',
+          actiondeep: '#1E4497',
+          danger: '#C0392B',
+          okay: '#1E8E5A'
+        },
+        fontFamily: {
+          display: ['Archivo', 'Avenir Next', 'Segoe UI', 'system-ui', 'sans-serif'],
+          body: ['Inter', 'Segoe UI', 'system-ui', 'sans-serif'],
+          mono: ['JetBrains Mono', 'ui-monospace', 'SFMono-Regular', 'Menlo', 'monospace']
+        }
+      }
+    }
+  }
+</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;700;900&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<style>
+  body { font-family: Inter, 'Segoe UI', system-ui, sans-serif; }
+
+  /* Signature: highlighter sweep on target words inside previews */
+  .preview b, .hl {
+    font-weight: 600;
+    background-image: linear-gradient(104deg, rgba(255,228,92,0) 1%, rgba(255,228,92,.95) 3%, rgba(255,228,92,.85) 97%, rgba(255,228,92,0) 99%);
+    padding: 0 .15em;
+    margin: 0 -.05em;
+    border-radius: .12em;
+    box-decoration-break: clone;
+    -webkit-box-decoration-break: clone;
+  }
+
+  .index-card {
+    background:
+      linear-gradient(to bottom, transparent 0, transparent 2.1rem, #E4E9F0 2.1rem, #E4E9F0 calc(2.1rem + 1px), transparent calc(2.1rem + 1px)),
+      #FFFFFF;
+    border: 1px solid #DDE3EA;
+    border-radius: .5rem;
+    box-shadow: 0 1px 2px rgba(30,42,56,.06), 0 6px 16px -8px rgba(30,42,56,.12);
+  }
+  .index-card .card-label { height: 2.1rem; display: flex; align-items: center; padding: 0 1rem; }
+
+  .cloze-blank {
+    background: #EAF0FB;
+    border-bottom: 2px solid #2B59C3;
+    color: #2B59C3;
+    padding: 0 .35em;
+    border-radius: .2em .2em 0 0;
+    font-weight: 600;
+  }
+
+  .spin { animation: spin 1s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  audio { width: 100%; height: 2.25rem; }
+
+  input:focus-visible, select:focus-visible, button:focus-visible, summary:focus-visible {
+    outline: 2px solid #2B59C3; outline-offset: 2px;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .spin { animation-duration: 2.5s; }
+    * { scroll-behavior: auto !important; transition-duration: .01ms !important; }
+  }
+
+  details > summary { list-style: none; cursor: pointer; }
+  details > summary::-webkit-details-marker { display: none; }
+  details[open] .chev { transform: rotate(180deg); }
+
+  .dot { width:.5rem; height:.5rem; border-radius:9999px; display:inline-block; }
+  .dot-ok   { background:#1E8E5A; }
+  .dot-busy { background:#F5C400; animation: pulse 1.2s ease-in-out infinite; }
+  .dot-err  { background:#C0392B; }
+  .dot-off  { background:#B7C0CB; }
+  @keyframes pulse { 50% { opacity:.35; } }
+
+  .icon-btn {
+    width: 2.35rem; height: 2.35rem;
+    display: grid; place-items: center;
+    border: 1px solid rgba(30,42,56,.15); border-radius: .5rem;
+    color: #5C6B7A; background: #fff;
+  }
+  .icon-btn:hover:not(:disabled) { background: #F5F6F3; color: #1E2A38; }
+  .icon-btn:disabled { opacity: .35; cursor: not-allowed; }
+
+  /* hero decorative W */
+  .hero-w {
+    position: absolute; right: -1rem; bottom: -2.4rem;
+    font-family: Archivo, sans-serif; font-weight: 900;
+    font-size: 11rem; line-height: 1; color: rgba(255,228,92,.08);
+    pointer-events: none; user-select: none;
+  }
+
+  .lang-chip { transition: background .15s, color .15s; }
+
+  #studyOverlay, #settingsOverlay, #statsOverlay { padding-bottom: env(safe-area-inset-bottom); }
+  .overlay { position: fixed; inset: 0; z-index: 40; overflow-y: auto; }
+
+  /* stats bars */
+  .bar { background: #2B59C3; border-radius: 3px 3px 0 0; min-height: 2px; transition: height .3s; }
+  .bar-today { background: #F5C400; }
+</style>
+</head>
+<body class="bg-paper text-ink min-h-screen">
+
+<!-- ============ HEADER ============ -->
+<header class="border-b border-ink/10 bg-card/80 backdrop-blur sticky top-0 z-20">
+  <div class="max-w-3xl mx-auto px-4 sm:px-6 py-3 flex items-center gap-3">
+    <div class="flex items-center gap-2.5">
+      <div class="w-8 h-8 rounded-md bg-ink text-mark grid place-items-center font-display font-black text-lg select-none" aria-hidden="true">W</div>
+      <h1 class="font-display font-black text-lg leading-none tracking-tight">Wordstack</h1>
+    </div>
+    <div class="ml-auto flex items-center gap-2">
+      <button id="syncNowBtn" class="flex items-center gap-1.5 pr-1 text-xs font-mono text-inkfaint hover:text-ink" title="Sync now">
+        <span id="syncDot" class="dot dot-off"></span><span id="syncLabel" class="hidden sm:inline">local</span>
+      </button>
+      <button id="statsBtn" class="icon-btn" title="Statistics" aria-label="Statistics">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" aria-hidden="true"><line x1="5" y1="20" x2="5" y2="12"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="19" y1="20" x2="19" y2="9"/></svg>
+      </button>
+      <button id="exportBtn" class="icon-btn" title="Export all decks to Anki (3 files)" aria-label="Export to Anki" disabled>
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+      </button>
+      <button id="settingsBtn" class="icon-btn" title="Settings" aria-label="Settings">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+      </button>
+    </div>
+  </div>
+</header>
+
+<main class="max-w-3xl mx-auto px-4 sm:px-6 py-6 space-y-5">
+
+<!-- ============ HERO — study first ============ -->
+<section id="hero" class="relative overflow-hidden bg-ink text-white rounded-2xl p-6 sm:p-8" aria-labelledby="heroTitle">
+  <div class="hero-w" aria-hidden="true">W</div>
+  <p id="heroMeta" class="text-xs font-mono text-white/50"></p>
+  <h2 id="heroTitle" class="font-display font-black text-3xl sm:text-4xl mt-1 tracking-tight">Loading…</h2>
+  <p id="heroSub" class="text-sm text-white/60 mt-1"></p>
+
+  <div id="langChips" class="flex items-center gap-2 flex-wrap mt-4"></div>
+
+  <button id="studyBtn" class="mt-5 w-full sm:w-auto inline-flex items-center justify-center gap-2.5 bg-mark text-ink font-display font-bold text-lg px-10 py-3.5 rounded-xl hover:bg-markdeep active:scale-[.99] disabled:opacity-40 disabled:cursor-not-allowed" disabled>
+    <svg width="17" height="17" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><polygon points="6 3 21 12 6 21 6 3"/></svg>
+    Start studying
+  </button>
+</section>
+
+<!-- ============ ADD WORD ============ -->
+<section aria-labelledby="addHeading">
+  <h2 id="addHeading" class="sr-only">Add a word or phrase</h2>
+  <form id="wordForm" class="flex gap-2">
+    <input id="wordInput" type="text" autocomplete="off" placeholder="Add a word or phrase — e.g. give up, resilient…"
+      class="flex-1 min-w-0 rounded-xl px-4 py-3 text-base bg-white text-ink placeholder:text-ink/35 border border-ink/15 focus:border-action">
+    <button id="generateBtn" type="submit" aria-label="Generate cards"
+      class="inline-flex items-center justify-center gap-2 bg-ink text-mark font-display font-bold px-5 py-3 rounded-xl hover:bg-ink/85 disabled:opacity-50 whitespace-nowrap">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+      <span class="hidden sm:inline">Forge</span>
+    </button>
+  </form>
+  <p id="formError" class="hidden text-danger text-sm mt-2 font-medium" role="alert"></p>
+</section>
+
+<!-- ============ LIBRARY (collapsible) ============ -->
+<details id="libDetails" class="group">
+  <summary class="flex items-center gap-2 py-1 select-none">
+    <h2 class="font-display font-bold text-sm uppercase tracking-wider text-inkfaint">Word library</h2>
+    <span id="libCount" class="text-xs font-mono text-inkfaint"></span>
+    <svg class="chev ml-auto text-inkfaint transition-transform" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" aria-hidden="true"><polyline points="6 9 12 15 18 9"/></svg>
+  </summary>
+  <div id="emptyState" class="index-card p-8 text-center mt-2">
+    <div class="card-label"></div>
+    <p class="font-display font-bold text-lg">No cards yet</p>
+    <p class="text-sm text-inkfaint mt-1 max-w-md mx-auto">Add a word above. Each word becomes a Reading, Listening, and Speaking card set — saved permanently, reviewed here with spaced repetition, and exportable to Anki any time. First add your OpenAI key under ⚙ Settings.</p>
+  </div>
+  <div id="setList" class="space-y-4 mt-2"></div>
+</details>
+
+<footer class="text-center text-[11px] text-inkfaint pb-8 pt-2">
+  Works offline as an installed app · your data lives in this browser and (when signed in) your own Supabase project
+</footer>
+
+</main>
+
+<!-- ============ SETTINGS OVERLAY ============ -->
+<div id="settingsOverlay" class="overlay hidden bg-paper">
+  <div class="max-w-2xl mx-auto px-4 sm:px-6 py-4">
+    <div class="flex items-center gap-3 mb-4">
+      <button id="settingsClose" class="icon-btn" aria-label="Close settings">✕</button>
+      <h2 class="font-display font-black text-xl">Settings</h2>
+      <span class="ml-auto text-xs font-mono text-inkfaint">stored on this device</span>
+    </div>
+
+    <div class="bg-card border border-ink/10 rounded-lg p-4 sm:p-5 space-y-5">
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <div>
+          <label for="apiKey" class="block text-sm font-medium mb-1">OpenAI API key</label>
+          <div class="flex gap-2">
+            <input id="apiKey" type="password" autocomplete="off" spellcheck="false" placeholder="sk-..."
+              class="flex-1 min-w-0 border border-ink/20 rounded-md px-3 py-2 text-sm font-mono bg-white placeholder:text-ink/30">
+            <button id="toggleKey" type="button" class="px-3 border border-ink/20 rounded-md text-inkfaint hover:bg-paper text-xs font-medium" aria-label="Show or hide API key">Show</button>
+          </div>
+          <label class="mt-1.5 flex items-center gap-1.5 text-xs text-inkfaint">
+            <input id="rememberKey" type="checkbox" class="accent-action" checked>
+            Remember key on this device
+          </label>
+          <p class="text-[11px] text-inkfaint mt-1">Sent only to api.openai.com. Saved in this browser so you never re-enter it.</p>
+        </div>
+        <div class="grid grid-cols-2 gap-3 content-start">
+          <div>
+            <label for="nativeLang" class="block text-sm font-medium mb-1">Native language</label>
+            <select id="nativeLang" class="w-full border border-ink/20 rounded-md px-2.5 py-2 text-sm bg-white"></select>
+          </div>
+          <div>
+            <label for="targetLang" class="block text-sm font-medium mb-1">Target language</label>
+            <select id="targetLang" class="w-full border border-ink/20 rounded-md px-2.5 py-2 text-sm bg-white"></select>
+          </div>
+          <div>
+            <label for="voice" class="block text-sm font-medium mb-1">Speech voice</label>
+            <select id="voice" class="w-full border border-ink/20 rounded-md px-2.5 py-2 text-sm bg-white">
+              <option value="alloy">Alloy — neutral</option>
+              <option value="nova" selected>Nova — bright</option>
+              <option value="shimmer">Shimmer — soft</option>
+              <option value="echo">Echo — deep</option>
+              <option value="onyx">Onyx — low</option>
+              <option value="fable">Fable — warm</option>
+            </select>
+          </div>
+          <div>
+            <label for="newPerDay" class="block text-sm font-medium mb-1">New cards / day <span class="text-inkfaint font-normal">(per language)</span></label>
+            <input id="newPerDay" type="number" min="0" max="999" value="20" class="w-full border border-ink/20 rounded-md px-2.5 py-2 text-sm bg-white">
+          </div>
+        </div>
+      </div>
+
+      <div class="border-t border-ink/10 pt-4">
+        <h3 class="font-display font-bold text-sm uppercase tracking-wider text-inkfaint mb-1">Cloud sync (Supabase)</h3>
+        <p class="text-[11px] text-inkfaint mb-3">One-time setup — see README. After signing in once, this device stays connected.</p>
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+          <div>
+            <label for="sbUrl" class="block text-xs font-medium mb-1">Project URL</label>
+            <input id="sbUrl" type="text" autocomplete="off" spellcheck="false" placeholder="https://xxxx.supabase.co"
+              class="w-full border border-ink/20 rounded-md px-3 py-2 text-sm font-mono bg-white placeholder:text-ink/30">
+          </div>
+          <div>
+            <label for="sbKey" class="block text-xs font-medium mb-1">Anon (public) key</label>
+            <input id="sbKey" type="password" autocomplete="off" spellcheck="false" placeholder="eyJ..."
+              class="w-full border border-ink/20 rounded-md px-3 py-2 text-sm font-mono bg-white placeholder:text-ink/30">
+          </div>
+          <div>
+            <label for="sbEmail" class="block text-xs font-medium mb-1">Email</label>
+            <input id="sbEmail" type="email" autocomplete="username" placeholder="you@example.com"
+              class="w-full border border-ink/20 rounded-md px-3 py-2 text-sm bg-white placeholder:text-ink/30">
+          </div>
+          <div>
+            <label for="sbPass" class="block text-xs font-medium mb-1">Password</label>
+            <input id="sbPass" type="password" autocomplete="current-password" placeholder="••••••••"
+              class="w-full border border-ink/20 rounded-md px-3 py-2 text-sm bg-white placeholder:text-ink/30">
+          </div>
+        </div>
+        <div class="flex items-center gap-2 mt-3 flex-wrap">
+          <button id="signInBtn" class="bg-action text-white text-sm font-medium px-4 py-2 rounded-md hover:bg-actiondeep">Sign in</button>
+          <button id="signUpBtn" class="border border-ink/20 text-sm font-medium px-4 py-2 rounded-md hover:bg-paper">Create account</button>
+          <button id="signOutBtn" class="hidden border border-danger/30 text-danger text-sm font-medium px-4 py-2 rounded-md hover:bg-danger/5">Sign out</button>
+          <span id="authStatus" class="text-xs text-inkfaint font-mono"></span>
+        </div>
+        <p id="authError" class="hidden text-danger text-xs mt-2 font-medium" role="alert"></p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ============ STATS OVERLAY ============ -->
+<div id="statsOverlay" class="overlay hidden bg-paper">
+  <div class="max-w-2xl mx-auto px-4 sm:px-6 py-4">
+    <div class="flex items-center gap-3 mb-4">
+      <button id="statsClose" class="icon-btn" aria-label="Close statistics">✕</button>
+      <h2 class="font-display font-black text-xl">Statistics</h2>
+      <span id="statsLangLabel" class="ml-auto text-xs font-mono text-inkfaint"></span>
+    </div>
+    <div id="statsBody" class="space-y-4"></div>
+  </div>
+</div>
+
+<!-- ============ STUDY OVERLAY ============ -->
+<div id="studyOverlay" class="overlay hidden bg-paper">
+  <div class="max-w-2xl mx-auto px-4 sm:px-6 py-4 min-h-full flex flex-col">
+    <div class="flex items-center gap-3">
+      <button id="studyClose" class="icon-btn" aria-label="Close study session">✕</button>
+      <span id="studyDeckChip" class="text-xs font-display font-bold uppercase tracking-wider px-2.5 py-1 rounded-md bg-ink text-white"></span>
+      <span id="studyLangChip" class="text-xs font-mono text-inkfaint"></span>
+      <span id="studyProgress" class="ml-auto text-xs font-mono text-inkfaint"></span>
+    </div>
+
+    <div class="flex-1 py-5 preview" id="studyFaceWrap">
+      <div id="studyFront"></div>
+      <div id="studyBack" class="hidden mt-4 pt-4 border-t-2 border-dashed border-ink/15"></div>
+    </div>
+
+    <div class="sticky bottom-0 bg-paper pt-2 pb-4">
+      <button id="showAnswerBtn" class="w-full bg-ink text-white font-display font-bold py-3.5 rounded-md hover:bg-ink/85">
+        Show answer <span class="font-mono text-xs opacity-60 hidden sm:inline">(space)</span>
+      </button>
+      <div id="ratingBar" class="hidden grid grid-cols-4 gap-2">
+        <button data-rate="again" class="flex flex-col items-center py-2.5 rounded-md bg-danger text-white font-display font-bold hover:opacity-90">
+          Again <span data-ivl="again" class="text-[11px] font-mono font-normal opacity-80"></span>
+        </button>
+        <button data-rate="hard" class="flex flex-col items-center py-2.5 rounded-md bg-[#E8590C] text-white font-display font-bold hover:opacity-90">
+          Hard <span data-ivl="hard" class="text-[11px] font-mono font-normal opacity-80"></span>
+        </button>
+        <button data-rate="good" class="flex flex-col items-center py-2.5 rounded-md bg-action text-white font-display font-bold hover:opacity-90">
+          Good <span data-ivl="good" class="text-[11px] font-mono font-normal opacity-80"></span>
+        </button>
+        <button data-rate="easy" class="flex flex-col items-center py-2.5 rounded-md bg-okay text-white font-display font-bold hover:opacity-90">
+          Easy <span data-ivl="easy" class="text-[11px] font-mono font-normal opacity-80"></span>
+        </button>
+      </div>
+      <p class="text-center text-[10px] font-mono text-inkfaint mt-1.5 hidden sm:block">1 again · 2 hard · 3 good · 4 easy</p>
+    </div>
+  </div>
+
+  <div id="studyDone" class="hidden absolute inset-0 bg-paper grid place-items-center px-6">
+    <div class="index-card p-8 text-center max-w-sm w-full">
+      <div class="card-label"></div>
+      <p class="text-3xl">🎉</p>
+      <p class="font-display font-bold text-lg mt-2">All caught up</p>
+      <p id="studyDoneMsg" class="text-sm text-inkfaint mt-1"></p>
+      <button id="studyDoneClose" class="mt-4 bg-ink text-white font-display font-bold px-6 py-2.5 rounded-md hover:bg-ink/85">Back</button>
+    </div>
+  </div>
+</div>
+
+<!-- toast -->
+<div id="toast" class="hidden fixed left-1/2 -translate-x-1/2 bottom-5 z-50 bg-ink text-white text-sm font-medium px-4 py-2.5 rounded-lg shadow-lg max-w-[90vw]"></div>
+
+<script>
+/* ============================================================
+   Wordstack — flashcard forge + built-in SRS + Supabase sync
+   v2: per-language study queues · settings modal · stats
+   dashboard (synced review log) · export as header action
+   The Anki export pipeline is IDENTICAL to the original app.
+   ============================================================ */
+'use strict';
+
+/* ---------- constants ---------- */
+const LANGUAGES = [
+  'English','Spanish','French','German','Italian','Portuguese','Dutch','Polish','Turkish',
+  'Russian','Ukrainian','Chinese (Mandarin)','Japanese','Korean','Arabic','Hindi','Vietnamese','Swedish'
+];
+const OPENAI_BASE = 'https://api.openai.com/v1';
+const CHAT_MODEL  = 'gpt-4o-mini';
+const TTS_MODEL   = 'tts-1';
+const DECKS = ['reading','listening','speaking'];
+const NATIVE_SPAN = t => '<span style="color: #666666; font-size: 0.9em;">' + t + '</span>';
+const AUDIO_TAG   = b64 => b64
+  ? '<audio controls preload="none" style="width:100%;max-width:420px;" src="data:audio/mp3;base64,' + b64 + '"></audio>'
+  : '<div style="font-size:.85em;color:#8A94A6;border:1px dashed #C9D2DD;border-radius:8px;padding:8px 12px;">Audio not on this device yet — it downloads automatically when online &amp; signed in.</div>';
+
+/* ---------- styled Anki card HTML (inline CSS only — survives plain import) ---------- */
+const CARD_FONT = "-apple-system,'Segoe UI',Roboto,'Noto Sans','Helvetica Neue',sans-serif";
+
+const HL_B = inner =>
+  '<b style="font-weight:700;color:#1E2A38;background:#FFE45C;padding:0 .18em;border-radius:4px;">' + inner + '</b>';
+
+function cardShell(inner, accentFrom, accentTo, badge) {
+  return '<div style="font-family:' + CARD_FONT + ';max-width:560px;margin:8px auto;text-align:left;background:#FFFFFF;border:1px solid #E3E8F0;border-radius:16px;overflow:hidden;box-shadow:0 6px 18px rgba(20,30,55,.10);">'
+    + '<div style="height:6px;background:linear-gradient(90deg,' + accentFrom + ',' + accentTo + ');"></div>'
+    + '<div style="padding:16px 20px 18px;">'
+    + (badge ? '<div style="font-size:.68em;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:#8A94A6;margin-bottom:10px;">' + badge + '</div>' : '')
+    + inner
+    + '</div></div>';
+}
+
+const numChip = n =>
+  '<span style="flex:none;display:inline-block;width:22px;height:22px;line-height:22px;text-align:center;background:#EEF2FB;color:#2B59C3;border-radius:50%;font-size:.72em;font-weight:700;margin-right:10px;">' + n + '</span>';
+
+const sentenceRow = (n, html) =>
+  '<div style="display:flex;align-items:flex-start;margin:9px 0;font-size:1.04em;line-height:1.6;color:#1E2A38;">' + numChip(n) + '<span>' + html + '</span></div>';
+
+const wordChip = (word, translation) =>
+  '<div style="display:inline-block;background:#1E2A38;color:#FFE45C;font-weight:700;font-size:1.15em;padding:6px 14px;border-radius:10px;">' + word + '</div>'
+  + (translation ? '<div style="margin-top:10px;font-size:1.05em;color:#1E2A38;font-weight:600;">' + translation + '</div>' : '');
+
+const ACCENTS = {
+  reading:   ['#2B59C3', '#7C3AED'],
+  listening: ['#0EA5A4', '#2B59C3'],
+  speaking:  ['#E8590C', '#F5C400']
+};
+
+function readingFront(set) {
+  const rows = set.data.sentences
+    .map((s, i) => sentenceRow(i + 1, boldify(s.target, s.word_form, set.word)))
+    .join('');
+  return cardShell(rows, ...ACCENTS.reading, 'Reading · spot the word');
+}
+function readingBack(set) {
+  const inner = wordChip(esc(set.word), esc(set.data.word_translation))
+    + '<div style="margin-top:10px;">' + NATIVE_SPAN(esc(set.data.definition)) + '</div>';
+  return cardShell(inner, ...ACCENTS.reading, 'Meaning');
+}
+function listeningFront(s) {
+  const inner = '<div style="text-align:center;padding:4px 0 2px;">'
+    + '<div style="font-size:2em;line-height:1;margin-bottom:10px;">🎧</div>'
+    + AUDIO_TAG(s.audio)
+    + '<div style="margin-top:10px;font-size:.8em;color:#8A94A6;">Listen, then recall the full sentence</div>'
+    + '</div>';
+  return cardShell(inner, ...ACCENTS.listening, 'Listening');
+}
+function listeningBack(set, s) {
+  const inner = '<div style="font-size:1.1em;line-height:1.6;color:#1E2A38;">'
+    + boldify(s.target, s.word_form, set.word) + '</div>'
+    + '<div style="margin-top:8px;">' + NATIVE_SPAN(esc(s.native)) + '</div>';
+  return cardShell(inner, ...ACCENTS.listening, 'Sentence');
+}
+function speakingText(set, s) {
+  const cloze = clozify(s.target, s.word_form, set.word, set.data.word_translation);
+  const inner = '<div style="font-size:1.1em;line-height:1.7;color:#1E2A38;">' + cloze + '</div>'
+    + '<div style="margin-top:12px;font-size:.8em;color:#8A94A6;">Say the complete sentence out loud</div>';
+  return cardShell(inner, ...ACCENTS.speaking, 'Speaking · fill the gap');
+}
+function speakingExtra(set, s) {
+  const inner = AUDIO_TAG(s.audio)
+    + '<div style="margin-top:10px;">' + NATIVE_SPAN(esc(s.native)) + '</div>'
+    + '<div style="margin-top:8px;font-size:.8em;color:#8A94A6;">Shadow the audio two or three times</div>';
+  return cardShell(inner, ...ACCENTS.speaking, 'Answer · shadow it');
+}
+
+/* ---------- state ---------- */
+const state = {
+  sets: [],                 // persisted (status 'done') + transient (loading/error), newest first
+  reviews: new Map(),       // card_id -> review row (DB shape)
+  revlog: new Map(),        // id -> log entry (one per answered card, powers stats)
+  meta: { lastSync: null, pending: [], newIntro: null },
+  studyLang: 'all',
+  studying: null
+};
+
+/* ---------- tiny utils ---------- */
+const $ = sel => document.querySelector(sel);
+const esc = s => String(s ?? '')
+  .replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;')
+  .replaceAll('"','&quot;').replaceAll("'",'&#39;');
+const stripField = s => String(s ?? '').replace(/\t/g,' ').replace(/\r?\n/g,'<br>');
+const nowISO = () => new Date().toISOString();
+/* timestamptz strings arrive in mixed formats ("…Z" locally, "…+00:00" from
+   Postgres) — always compare through Date, never lexicographically */
+const tsGt = (a, b) => new Date(a || 0) > new Date(b || 0);
+const tsAsc = key => (a, b) => new Date(key(a)) - new Date(key(b));
+const uuid = () => (crypto.randomUUID ? crypto.randomUUID()
+  : 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
+      const r = Math.random() * 16 | 0; return (c === 'x' ? r : (r & 3 | 8)).toString(16);
+    }));
+/* LOCAL calendar day (not UTC) so late-evening reviews count to the right day */
+const dayKey = (d = new Date()) => {
+  const x = new Date(d);
+  return x.getFullYear() + '-' + String(x.getMonth() + 1).padStart(2, '0') + '-' + String(x.getDate()).padStart(2, '0');
+};
+
+function safeStore(action, key, value) {
+  try {
+    if (action === 'get')    return localStorage.getItem(key);
+    if (action === 'set')    return localStorage.setItem(key, value);
+    if (action === 'remove') return localStorage.removeItem(key);
+  } catch { return null; }
+}
+
+let toastTimer = null;
+function toast(msg, ms = 3500) {
+  const el = $('#toast');
+  el.textContent = msg;
+  el.classList.remove('hidden');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.classList.add('hidden'), ms);
+}
+
+/* ---------- IndexedDB ---------- */
+let _db = null;
+function idbOpen() {
+  return new Promise((res, rej) => {
+    const q = indexedDB.open('wordstack', 2);
+    q.onupgradeneeded = e => {
+      const db = e.target.result;
+      const has = n => db.objectStoreNames.contains(n);
+      if (!has('sets'))    db.createObjectStore('sets',    { keyPath: 'id' });
+      if (!has('reviews')) db.createObjectStore('reviews', { keyPath: 'card_id' });
+      if (!has('audio'))   db.createObjectStore('audio');
+      if (!has('meta'))    db.createObjectStore('meta');
+      if (!has('revlog'))  db.createObjectStore('revlog',  { keyPath: 'id' });   // v2
+    };
+    q.onsuccess = () => res(q.result);
+    q.onerror   = () => rej(q.error);
+  });
+}
+function idbTx(store, mode, fn) {
+  return new Promise((res, rej) => {
+    const tx = _db.transaction(store, mode);
+    const os = tx.objectStore(store);
+    const out = fn(os);
+    tx.oncomplete = () => res(out && out.result !== undefined ? out.result : undefined);
+    tx.onerror = () => rej(tx.error);
+  });
+}
+const idbPut = (store, val, key) => idbTx(store, 'readwrite', os => key !== undefined ? os.put(val, key) : os.put(val));
+const idbDel = (store, key)      => idbTx(store, 'readwrite', os => os.delete(key));
+const idbGet = (store, key)      => idbTx(store, 'readonly',  os => os.get(key));
+const idbAll = store             => idbTx(store, 'readonly',  os => os.getAll());
+const saveMeta = () => idbPut('meta', JSON.parse(JSON.stringify(state.meta)), 'meta');
+
+/* ---------- config ---------- */
+const cfg = {
+  get sbUrl()     { return safeStore('get', 'wordstack.sbUrl')  || ''; },
+  get sbKey()     { return safeStore('get', 'wordstack.sbKey')  || ''; },
+  get newPerDay() { return Math.max(0, parseInt(safeStore('get', 'wordstack.newPerDay') || '20', 10) || 0); }
+};
+
+/* ---------- separable-phrase aware matching ---------- */
+const rescape = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const splitPhrase = w => String(w ?? '')
+  .split(/\s*(?:\.{2,}|…)\s*/)
+  .map(t => t.trim())
+  .filter(Boolean);
+
+function findParts(safe, parts) {
+  const ranges = [];
+  let from = 0;
+  for (const p of parts) {
+    const pat = new RegExp(rescape(esc(p)), 'ig');
+    pat.lastIndex = from;
+    const m = pat.exec(safe);
+    if (!m) return null;
+    ranges.push([m.index, m.index + m[0].length]);
+    from = m.index + m[0].length;
+  }
+  return ranges;
+}
+
+function wrapRanges(safe, ranges, wrapFn) {
+  let out = '', prev = 0;
+  for (const [a, b] of ranges) {
+    out += safe.slice(prev, a) + wrapFn(safe.slice(a, b));
+    prev = b;
+  }
+  return out + safe.slice(prev);
+}
+
+function boldify(sentence, form, baseWord) {
+  const safe = esc(sentence);
+  for (const needle of [form, baseWord]) {
+    const parts = splitPhrase(needle);
+    if (!parts.length) continue;
+    if (parts.length === 1) {
+      const pattern = new RegExp(rescape(esc(parts[0])), 'gi');
+      if (pattern.test(safe)) return safe.replace(pattern, m => HL_B(m));
+    } else {
+      const ranges = findParts(safe, parts);
+      if (ranges) return wrapRanges(safe, ranges, m => HL_B(m));
+    }
+  }
+  return safe;
+}
+
+function clozify(sentence, form, baseWord, hint) {
+  const safe = esc(sentence);
+  const hintSpan = NATIVE_SPAN(esc(hint));
+  const wrap = m => '{{c1::' + HL_B(m) + '::' + hintSpan + '}}';
+  for (const needle of [form, baseWord]) {
+    const parts = splitPhrase(needle);
+    if (!parts.length) continue;
+    const ranges = findParts(safe, parts);
+    if (ranges) return wrapRanges(safe, ranges, wrap);
+  }
+  return wrap(safe);
+}
+
+function b64FromArrayBuffer(buf) {
+  const bytes = new Uint8Array(buf);
+  let binary = '';
+  const CHUNK = 0x8000;
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
+  }
+  return btoa(binary);
+}
+function blobFromB64(b64) {
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return new Blob([bytes], { type: 'audio/mpeg' });
+}
+
+/* ---------- OpenAI API layer (unchanged) ---------- */
+function apiKey() { return $('#apiKey').value.trim(); }
+
+function friendlyApiError(status, body) {
+  const msg = body?.error?.message || '';
+  if (status === 401) return 'Invalid or missing API key (401). Check the key in Settings.';
+  if (status === 429) return 'Rate limit or quota reached (429). Wait a moment and use Regenerate, or check your OpenAI billing.';
+  if (status === 403) return 'Access denied (403). Your key may not have access to this model.';
+  if (status >= 500)  return 'OpenAI is having trouble right now (' + status + '). Try Regenerate in a minute.';
+  return 'OpenAI error ' + status + (msg ? ': ' + msg : '');
+}
+
+async function callChat(word, nativeLang, targetLang) {
+  const sys = 'You generate language-learning example sentences. Respond with a single valid JSON object and nothing else. No markdown fences.';
+  const user =
+`Target language: ${targetLang}
+Native language: ${nativeLang}
+Target word or phrase: "${word}"
+
+Create EXACTLY 6 sentences in ${targetLang}, each containing the target word or phrase (inflected/conjugated forms are encouraged where natural). Keep sentences 6-18 words long.
+
+NATURALNESS — this is the top priority:
+- Write the way native speakers ACTUALLY talk, not like a textbook. Prefer idiomatic, colloquial phrasing; contractions and casual register are welcome where the language uses them.
+- Ground each sentence in a realistic everyday situation (chatting with a friend, texting, at work, complaining, telling a story, news, small talk). Vary tense, register, and context across the 6 sentences.
+- A native speaker reading the sentence should never think "nobody says it like that".
+
+SEPARABLE PHRASES:
+- If the target phrase contains "..." (e.g. "blows...out of the water"), it is separable: other words belong BETWEEN its parts. Use it naturally with real words in between (e.g. "blows this year's numbers out of the water").
+- In that case, word_form must return the parts as they actually appear in that sentence, joined by " ... " (e.g. "blows ... out of the water"). Each part must be copied verbatim from the sentence.
+
+Return JSON with this exact shape:
+{
+  "definition": "concise definition/explanation of the word in ${nativeLang} (max 25 words)",
+  "word_translation": "the closest single translation of just the word/phrase into ${nativeLang}",
+  "sentences": [
+    {
+      "target": "the sentence in ${targetLang}, plain text, no HTML",
+      "native": "faithful ${nativeLang} translation, plain text",
+      "word_form": "the EXACT substring of the target sentence that is the word/phrase as it appears there (verbatim, including inflection); for separable phrases: the parts verbatim, joined by ' ... '"
+    }
+  ]
+}
+The sentences array must have exactly 6 items. word_form must be copy-pasted verbatim from its sentence.`;
+
+  const res = await fetch(OPENAI_BASE + '/chat/completions', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + apiKey() },
+    body: JSON.stringify({
+      model: CHAT_MODEL,
+      temperature: 0.8,
+      response_format: { type: 'json_object' },
+      messages: [ { role: 'system', content: sys }, { role: 'user', content: user } ]
+    })
+  });
+  const body = await res.json().catch(() => null);
+  if (!res.ok) throw new Error(friendlyApiError(res.status, body));
+
+  let parsed;
+  try {
+    parsed = JSON.parse(body.choices[0].message.content.replace(/^```json\s*|```\s*$/g, ''));
+  } catch { throw new Error('The model returned malformed JSON. Hit Regenerate to retry.'); }
+
+  if (!Array.isArray(parsed.sentences) || parsed.sentences.length === 0) {
+    throw new Error('The model returned no sentences. Hit Regenerate to retry.');
+  }
+  parsed.sentences = parsed.sentences.slice(0, 6);
+  return parsed;
+}
+
+async function callTTS(text, voice) {
+  const res = await fetch(OPENAI_BASE + '/audio/speech', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + apiKey() },
+    body: JSON.stringify({ model: TTS_MODEL, voice, input: text, response_format: 'mp3' })
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => null);
+    throw new Error(friendlyApiError(res.status, body));
+  }
+  return b64FromArrayBuffer(await res.arrayBuffer());
+}
+
+/* ============================================================
+   SUPABASE — auth, sync engine, audio storage
+   ============================================================ */
+let supa = null;
+let sbUser = null;
+let syncTimer = null;
+let syncing = false, syncAgain = false;
+
+function initSupa() {
+  if (!cfg.sbUrl || !cfg.sbKey || !window.supabase) { setSyncUI('off'); return; }
+  try {
+    supa = window.supabase.createClient(cfg.sbUrl, cfg.sbKey);
+  } catch (e) { setSyncUI('err', 'Bad Supabase URL/key'); return; }
+  supa.auth.onAuthStateChange((_evt, session) => {
+    sbUser = session?.user || null;
+    updateAuthUI();
+    if (sbUser) scheduleSync(200);
+    else setSyncUI('off');
+  });
+  supa.auth.getSession().then(({ data }) => {
+    sbUser = data?.session?.user || null;
+    updateAuthUI();
+    if (sbUser) scheduleSync(200); else setSyncUI('off');
+  });
+}
+
+function setSyncUI(mode, msg) {
+  const dot = $('#syncDot'), label = $('#syncLabel');
+  dot.className = 'dot ' + ({ ok:'dot-ok', busy:'dot-busy', err:'dot-err', off:'dot-off', offline:'dot-off' }[mode] || 'dot-off');
+  label.textContent = mode === 'ok' ? 'synced'
+    : mode === 'busy' ? 'syncing…'
+    : mode === 'err' ? 'error'
+    : mode === 'offline' ? 'offline'
+    : 'local';
+  if (msg) label.title = msg;
+}
+
+function updateAuthUI() {
+  $('#authStatus').textContent = sbUser ? ('signed in as ' + (sbUser.email || 'user')) : 'not signed in';
+  $('#signOutBtn').classList.toggle('hidden', !sbUser);
+  $('#signInBtn').classList.toggle('hidden', !!sbUser);
+  $('#signUpBtn').classList.toggle('hidden', !!sbUser);
+}
+
+function queueOp(op) {
+  const key = JSON.stringify(op);
+  if (!state.meta.pending.some(p => JSON.stringify(p) === key)) state.meta.pending.push(op);
+  saveMeta();
+  scheduleSync(800);
+}
+function scheduleSync(delay) {
+  clearTimeout(syncTimer);
+  syncTimer = setTimeout(syncNow, delay);
+}
+
+async function syncNow() {
+  if (!supa || !sbUser) { setSyncUI('off'); return; }
+  if (!navigator.onLine) { setSyncUI('offline'); return; }
+  if (syncing) { syncAgain = true; return; }
+  syncing = true;
+  setSyncUI('busy');
+  try {
+    await pushPending();
+    await pullRemote();
+    setSyncUI('ok');
+  } catch (e) {
+    console.warn('sync failed:', e);
+    setSyncUI('err', e.message || String(e));
+  }
+  syncing = false;
+  if (syncAgain) { syncAgain = false; scheduleSync(300); }
+}
+
+const setToRow = s => ({
+  id: s.id, word: s.word,
+  native_lang: s.nativeLang, target_lang: s.targetLang, voice: s.voice,
+  data: s.data, deleted: !!s.deleted,
+  created_at: s.createdAt, updated_at: s.updatedAt
+});
+const rowToSet = r => ({
+  id: r.id, word: r.word,
+  nativeLang: r.native_lang, targetLang: r.target_lang, voice: r.voice,
+  data: r.data, deleted: !!r.deleted,
+  createdAt: r.created_at, updatedAt: r.updated_at,
+  status: 'done', error: null, previewIdx: 0, activeDeck: 'reading'
+});
+
+async function pushPending() {
+  const pending = [...state.meta.pending];
+  for (const op of pending) {
+    if (op.t === 'set') {
+      const local = await idbGet('sets', op.id);
+      if (local) {
+        const { error } = await supa.from('word_sets').upsert(setToRow(local), { onConflict: 'id' });
+        if (error) throw new Error('word_sets: ' + error.message);
+      }
+    } else if (op.t === 'review') {
+      const local = state.reviews.get(op.id);
+      if (local) {
+        const { error } = await supa.from('reviews').upsert(local, { onConflict: 'card_id' });
+        if (error) throw new Error('reviews: ' + error.message);
+      }
+    } else if (op.t === 'log') {
+      const local = state.revlog.get(op.id);
+      if (local) {
+        const { error } = await supa.from('revlog').upsert(local, { onConflict: 'id' });
+        if (error) throw new Error('revlog: ' + error.message);
+      }
+    } else if (op.t === 'audio') {
+      const local = await idbGet('sets', op.id);
+      const n = local?.data?.sentences?.length || 0;
+      for (let i = 0; i < n; i++) {
+        const b64 = await idbGet('audio', op.id + ':' + i);
+        if (!b64) continue;
+        const path = sbUser.id + '/' + op.id + '/' + i + '.mp3';
+        const { error } = await supa.storage.from('audio').upload(path, blobFromB64(b64), { upsert: true, contentType: 'audio/mpeg' });
+        if (error) throw new Error('audio upload: ' + error.message);
+      }
+    }
+    state.meta.pending = state.meta.pending.filter(p => JSON.stringify(p) !== JSON.stringify(op));
+    await saveMeta();
+  }
+}
+
+async function pullRemote() {
+  const since = state.meta.lastSync || '1970-01-01T00:00:00Z';
+  let maxSeen = since;
+  let changed = false;
+
+  const { data: rows, error: e1 } = await supa.from('word_sets')
+    .select('*').gt('updated_at', since).order('updated_at', { ascending: true }).limit(2000);
+  if (e1) throw new Error('pull word_sets: ' + e1.message);
+  for (const r of rows || []) {
+    if (tsGt(r.updated_at, maxSeen)) maxSeen = r.updated_at;
+    const local = await idbGet('sets', r.id);
+    if (!local || tsGt(r.updated_at, local.updatedAt)) {
+      const s = rowToSet(r);
+      await idbPut('sets', stripForStore(s));
+      const idx = state.sets.findIndex(x => x.id === s.id);
+      if (s.deleted) { if (idx >= 0) state.sets.splice(idx, 1); }
+      else if (idx >= 0) { Object.assign(state.sets[idx], s); }
+      else state.sets.push(s);
+      changed = true;
+    }
+  }
+
+  const { data: revs, error: e2 } = await supa.from('reviews')
+    .select('*').gt('updated_at', since).order('updated_at', { ascending: true }).limit(5000);
+  if (e2) throw new Error('pull reviews: ' + e2.message);
+  for (const r of revs || []) {
+    if (tsGt(r.updated_at, maxSeen)) maxSeen = r.updated_at;
+    delete r.user_id;
+    const local = state.reviews.get(r.card_id);
+    if (!local || tsGt(r.updated_at, local.updated_at)) {
+      state.reviews.set(r.card_id, r);
+      await idbPut('reviews', r);
+      changed = true;
+    }
+  }
+
+  /* review log: append-only, deduped by id */
+  const { data: logs, error: e3 } = await supa.from('revlog')
+    .select('id,card_id,set_id,lang,deck,rating,state,ivl,at,updated_at')
+    .gt('updated_at', since).order('updated_at', { ascending: true }).limit(5000);
+  if (e3) throw new Error('pull revlog: ' + e3.message);
+  for (const r of logs || []) {
+    if (tsGt(r.updated_at, maxSeen)) maxSeen = r.updated_at;
+    delete r.updated_at;
+    if (!state.revlog.has(r.id)) {
+      state.revlog.set(r.id, r);
+      await idbPut('revlog', r);
+      changed = true;
+    }
+  }
+
+  state.meta.lastSync = maxSeen;
+  await saveMeta();
+  if (changed) {
+    state.sets.sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
+    render();
+  }
+}
+
+/* ---------- audio persistence ---------- */
+async function saveSetAudio(set) {
+  for (let i = 0; i < set.data.sentences.length; i++) {
+    const b64 = set.data.sentences[i].audio;
+    if (b64) await idbPut('audio', b64, set.id + ':' + i);
+  }
+}
+async function deleteSetAudio(set) {
+  const n = set.data?.sentences?.length || 8;
+  for (let i = 0; i < n; i++) await idbDel('audio', set.id + ':' + i);
+}
+async function ensureAudio(set) {
+  if (!set.data) return false;
+  let ok = true;
+  for (let i = 0; i < set.data.sentences.length; i++) {
+    const s = set.data.sentences[i];
+    if (s.audio) continue;
+    let b64 = await idbGet('audio', set.id + ':' + i);
+    if (!b64 && supa && sbUser && navigator.onLine) {
+      try {
+        const { data, error } = await supa.storage.from('audio')
+          .download(sbUser.id + '/' + set.id + '/' + i + '.mp3');
+        if (!error && data) {
+          b64 = b64FromArrayBuffer(await data.arrayBuffer());
+          await idbPut('audio', b64, set.id + ':' + i);
+        }
+      } catch { /* handled by ok flag */ }
+    }
+    if (b64) s.audio = b64; else ok = false;
+  }
+  return ok;
+}
+
+function stripForStore(set) {
+  return {
+    id: set.id, word: set.word,
+    nativeLang: set.nativeLang, targetLang: set.targetLang, voice: set.voice,
+    createdAt: set.createdAt, updatedAt: set.updatedAt,
+    deleted: !!set.deleted, status: 'done',
+    data: set.data ? {
+      definition: set.data.definition,
+      word_translation: set.data.word_translation,
+      sentences: set.data.sentences.map(({ target, native, word_form }) => ({ target, native, word_form }))
+    } : null
+  };
+}
+async function persistSet(set, withAudio) {
+  set.updatedAt = nowISO();
+  await idbPut('sets', stripForStore(set));
+  if (withAudio) await saveSetAudio(set);
+  queueOp({ t: 'set', id: set.id });
+  if (withAudio) queueOp({ t: 'audio', id: set.id });
+}
+
+/* ============================================================
+   SRS — SM-2 scheduler, per-language queues
+   ============================================================ */
+const LEARN_STEPS_MIN = [1, 10];
+const RELEARN_STEPS_MIN = [10];
+const LEARN_AHEAD_MIN = 20;
+
+function newRev(cardId, setId, deck, idx) {
+  return {
+    card_id: cardId, set_id: setId, deck, idx,
+    state: 'new', step: 0, ivl: 0, ef: 2.5, reps: 0, lapses: 0,
+    due_at: nowISO(), updated_at: nowISO()
+  };
+}
+
+function applyRating(rev, rating, nowMs = Date.now()) {
+  const r = { ...rev };
+  const inMin = m => new Date(nowMs + m * 60000).toISOString();
+  const inDay = d => new Date(nowMs + d * 86400000).toISOString();
+  const clampEf = e => Math.max(1.3, e);
+
+  if (r.state === 'new') { r.state = 'learning'; r.step = 0; }
+
+  if (r.state === 'learning' || r.state === 'relearning') {
+    const steps = r.state === 'learning' ? LEARN_STEPS_MIN : RELEARN_STEPS_MIN;
+    const graduate = easy => {
+      r.ivl = r.state === 'relearning'
+        ? Math.max(1, Math.round(r.ivl * 0.5)) + (easy ? 1 : 0)
+        : (easy ? 4 : 1);
+      r.state = 'review'; r.step = 0; r.due_at = inDay(r.ivl);
+    };
+    if (rating === 'again')      { r.step = 0; r.due_at = inMin(steps[0]); }
+    else if (rating === 'hard')  { r.due_at = inMin(Math.max(steps[Math.min(r.step, steps.length - 1)] * 1.5, 5)); }
+    else if (rating === 'good')  {
+      r.step += 1;
+      if (r.step >= steps.length) graduate(false);
+      else r.due_at = inMin(steps[r.step]);
+    }
+    else                         { graduate(true); }
+  } else {
+    if (rating === 'again') {
+      r.lapses += 1; r.ef = clampEf(r.ef - 0.2);
+      r.state = 'relearning'; r.step = 0; r.due_at = inMin(RELEARN_STEPS_MIN[0]);
+    } else if (rating === 'hard') {
+      r.ivl = Math.max(r.ivl + 1, Math.round(r.ivl * 1.2));
+      r.ef = clampEf(r.ef - 0.15); r.due_at = inDay(r.ivl);
+    } else if (rating === 'good') {
+      r.ivl = Math.max(r.ivl + 1, Math.round(r.ivl * r.ef)); r.due_at = inDay(r.ivl);
+    } else {
+      r.ivl = Math.max(r.ivl + 2, Math.round(r.ivl * r.ef * 1.3));
+      r.ef = clampEf(r.ef + 0.15); r.due_at = inDay(r.ivl);
+    }
+    r.ivl = Math.min(r.ivl, 36500);
+  }
+  r.reps += 1;
+  r.updated_at = nowISO();
+  return r;
+}
+
+function fmtDue(iso) {
+  const ms = new Date(iso) - Date.now();
+  const min = Math.round(ms / 60000);
+  if (min < 60) return Math.max(1, min) + 'm';
+  if (min < 60 * 36) return Math.round(min / 60) + 'h';
+  const d = Math.round(ms / 86400000);
+  if (d < 31) return d + 'd';
+  if (d < 365) return (Math.round(d / 30.4 * 10) / 10) + 'mo';
+  return (Math.round(d / 365 * 10) / 10) + 'y';
+}
+
+/* every language with at least one ready word set */
+function langsAvailable() {
+  return [...new Set(state.sets.filter(s => s.status === 'done' && s.data).map(s => s.targetLang))].sort();
+}
+
+function allCards(lang = 'all') {
+  const out = [];
+  for (const set of state.sets) {
+    if (set.status !== 'done' || !set.data || set.deleted) continue;
+    if (lang !== 'all' && set.targetLang !== lang) continue;
+    const n = set.data.sentences.length;
+    out.push({ cardId: set.id + '|reading|0', set, deck: 'reading', idx: 0 });
+    for (let i = 0; i < n; i++) out.push({ cardId: set.id + '|listening|' + i, set, deck: 'listening', idx: i });
+    for (let i = 0; i < n; i++) out.push({ cardId: set.id + '|speaking|' + i, set, deck: 'speaking', idx: i });
+  }
+  return out;
+}
+
+/* new-cards-per-day accounting, tracked PER TARGET LANGUAGE */
+function introducedToday(lang) {
+  const m = state.meta.newIntro;
+  if (!m || m.day !== dayKey()) return 0;
+  return (m.byLang && m.byLang[lang]) || 0;
+}
+function bumpIntroducedToday(lang) {
+  if (!state.meta.newIntro || state.meta.newIntro.day !== dayKey()) {
+    state.meta.newIntro = { day: dayKey(), byLang: {} };
+  }
+  if (!state.meta.newIntro.byLang) state.meta.newIntro.byLang = {};
+  state.meta.newIntro.byLang[lang] = (state.meta.newIntro.byLang[lang] || 0) + 1;
+  saveMeta();
+}
+const remainingNew = lang => Math.max(0, cfg.newPerDay - introducedToday(lang));
+
+function dueCounts(lang = state.studyLang) {
+  const now = Date.now();
+  const endOfDay = new Date(); endOfDay.setHours(23, 59, 59, 999);
+  let learn = 0, due = 0;
+  const freshByLang = {};
+  for (const c of allCards(lang)) {
+    const r = state.reviews.get(c.cardId);
+    if (!r || r.state === 'new') {
+      freshByLang[c.set.targetLang] = (freshByLang[c.set.targetLang] || 0) + 1;
+    } else if (r.state === 'learning' || r.state === 'relearning') {
+      if (new Date(r.due_at) - now <= LEARN_AHEAD_MIN * 60000) learn += 1;
+    } else if (new Date(r.due_at) <= endOfDay) { due += 1; }
+  }
+  let fresh = 0;
+  for (const [l, n] of Object.entries(freshByLang)) fresh += Math.min(n, remainingNew(l));
+  return { learn, due, fresh, total: learn + due + fresh };
+}
+
+/* earliest upcoming due among already-seen cards (for the "next due in…" hint) */
+function nextDueAt(lang = state.studyLang) {
+  let min = null;
+  const now = Date.now();
+  for (const c of allCards(lang)) {
+    const r = state.reviews.get(c.cardId);
+    if (!r || r.state === 'new') continue;
+    const t = new Date(r.due_at);
+    if (t > now && (!min || t < min)) min = t;
+  }
+  return min;
+}
+
+/* ---------- study session ---------- */
+function buildQueue(lang) {
+  const now = Date.now();
+  const endOfDay = new Date(); endOfDay.setHours(23, 59, 59, 999);
+  const learn = [], rev = [], freshAll = [];
+  for (const c of allCards(lang)) {
+    const r = state.reviews.get(c.cardId) || null;
+    const item = { ...c, rev: r || newRev(c.cardId, c.set.id, c.deck, c.idx) };
+    if (!r || r.state === 'new') freshAll.push(item);
+    else if (r.state === 'learning' || r.state === 'relearning') {
+      if (new Date(r.due_at) - now <= LEARN_AHEAD_MIN * 60000) learn.push(item);
+    }
+    else if (new Date(r.due_at) <= endOfDay) rev.push(item);
+  }
+  learn.sort(tsAsc(c => c.rev.due_at));
+  rev.sort(tsAsc(c => c.rev.due_at));
+  freshAll.sort(tsAsc(c => c.set.createdAt || 0));
+  // per-language daily cap on new cards
+  const taken = {};
+  const fresh = [];
+  for (const item of freshAll) {
+    const l = item.set.targetLang;
+    taken[l] = taken[l] || 0;
+    if (taken[l] < remainingNew(l)) { fresh.push(item); taken[l] += 1; }
+  }
+  return { learn, rev, fresh, done: 0, lang };
+}
+
+function pickNext(q) {
+  const now = Date.now();
+  const learnIdx = q.learn.findIndex(c => new Date(c.rev.due_at) <= now);
+  if (learnIdx >= 0) return q.learn.splice(learnIdx, 1)[0];
+  if (q.rev.length)   return q.rev.shift();
+  if (q.fresh.length) return q.fresh.shift();
+  if (q.learn.length) return q.learn.shift();
+  return null;
+}
+
+async function startStudy() {
+  const q = buildQueue(state.studyLang);
+  state.studying = { q, card: null };
+  $('#studyLangChip').textContent = state.studyLang === 'all' ? '' : state.studyLang;
+  $('#studyOverlay').classList.remove('hidden');
+  $('#studyDone').classList.add('hidden');
+  document.body.style.overflow = 'hidden';
+  await showNextCard();
+}
+
+async function showNextCard() {
+  const st = state.studying;
+  if (!st) return;
+  const card = pickNext(st.q);
+  if (!card) { finishStudy(); return; }
+  st.card = card;
+
+  const remaining = st.q.learn.length + st.q.rev.length + st.q.fresh.length + 1;
+  $('#studyProgress').textContent = st.q.done + ' done · ' + remaining + ' left';
+  const chip = $('#studyDeckChip');
+  chip.textContent = card.deck;
+  chip.style.background = 'linear-gradient(90deg,' + ACCENTS[card.deck][0] + ',' + ACCENTS[card.deck][1] + ')';
+
+  if (card.deck !== 'reading') {
+    $('#studyFront').innerHTML =
+      '<div class="flex items-center gap-3 text-sm text-inkfaint" role="status">' +
+      '<svg class="spin text-action" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" aria-hidden="true"><circle cx="12" cy="12" r="9" opacity=".2"/><path d="M21 12a9 9 0 0 0-9-9" stroke-linecap="round"/></svg>Loading audio…</div>';
+    await ensureAudio(card.set);
+    if (state.studying !== st || st.card !== card) return;
+  }
+
+  const s = card.set.data.sentences[card.idx];
+  let front, back;
+  if (card.deck === 'reading') {
+    front = readingFront(card.set);
+    back  = readingBack(card.set);
+  } else if (card.deck === 'listening') {
+    front = listeningFront(s);
+    back  = listeningBack(card.set, s);
+  } else {
+    const textRaw = speakingText(card.set, s);
+    const clozeRe = /\{\{c1::([\s\S]*?)::([\s\S]*?)\}\}/g;
+    front = textRaw.replace(clozeRe, '<span class="cloze-blank">[…$2…]</span>');
+    back  = textRaw.replace(clozeRe, '$1') + speakingExtra(card.set, s);
+  }
+
+  $('#studyFront').innerHTML = front;
+  $('#studyBack').innerHTML = back;
+  $('#studyBack').classList.add('hidden');
+  $('#ratingBar').classList.add('hidden');
+  $('#showAnswerBtn').classList.remove('hidden');
+
+  for (const rate of ['again', 'hard', 'good', 'easy']) {
+    document.querySelector('[data-ivl="' + rate + '"]').textContent = fmtDue(applyRating(card.rev, rate).due_at);
+  }
+
+  if (card.deck === 'listening') {
+    const audio = $('#studyFront').querySelector('audio');
+    if (audio) { try { const p = audio.play(); if (p && p.catch) p.catch(() => {}); } catch {} }
+  }
+  $('#studyFaceWrap').scrollTop = 0;
+  window.scrollTo(0, 0);
+}
+
+function revealAnswer() {
+  const st = state.studying;
+  if (!st || !st.card) return;
+  $('#studyBack').classList.remove('hidden');
+  $('#showAnswerBtn').classList.add('hidden');
+  $('#ratingBar').classList.remove('hidden');
+  if (st.card.deck === 'speaking') {
+    const audio = $('#studyBack').querySelector('audio');
+    if (audio) { try { const p = audio.play(); if (p && p.catch) p.catch(() => {}); } catch {} }
+  }
+}
+
+async function rateCard(rating) {
+  const st = state.studying;
+  if (!st || !st.card) return;
+  const card = st.card;
+  const wasNew = card.rev.state === 'new';
+  const updated = applyRating(card.rev, rating);
+
+  state.reviews.set(updated.card_id, updated);
+  await idbPut('reviews', updated);
+  queueOp({ t: 'review', id: updated.card_id });
+  if (wasNew) bumpIntroducedToday(card.set.targetLang);
+
+  /* append to the review log — powers the statistics dashboard */
+  const entry = {
+    id: uuid(), card_id: updated.card_id, set_id: card.set.id,
+    lang: card.set.targetLang, deck: card.deck, rating,
+    state: updated.state, ivl: updated.ivl, at: nowISO()
+  };
+  state.revlog.set(entry.id, entry);
+  await idbPut('revlog', entry);
+  queueOp({ t: 'log', id: entry.id });
+
+  if ((updated.state === 'learning' || updated.state === 'relearning')
+      && new Date(updated.due_at) - Date.now() <= LEARN_AHEAD_MIN * 60000) {
+    st.q.learn.push({ ...card, rev: updated });
+    st.q.learn.sort(tsAsc(c => c.rev.due_at));
+  }
+  st.q.done += 1;
+  updateHero();
+  await showNextCard();
+}
+
+function finishStudy() {
+  const st = state.studying;
+  $('#studyDoneMsg').textContent = st ? (st.q.done + ' card' + (st.q.done === 1 ? '' : 's') + ' reviewed. Come back when the next batch is due.') : '';
+  $('#studyDone').classList.remove('hidden');
+}
+function closeStudy() {
+  state.studying = null;
+  $('#studyOverlay').classList.add('hidden');
+  document.body.style.overflow = '';
+  updateHero();
+}
+
+/* ============================================================
+   STATISTICS (computed from the synced review log)
+   ============================================================ */
+function statsFor(lang = state.studyLang) {
+  const logs = [...state.revlog.values()].filter(l => lang === 'all' || l.lang === lang);
+  const today = dayKey();
+
+  const byDay = {};
+  const days = new Set();
+  for (const l of logs) {
+    const d = dayKey(new Date(l.at));
+    byDay[d] = (byDay[d] || 0) + 1;
+    days.add(d);
+  }
+
+  let streak = 0;
+  { const d = new Date();
+    if (!days.has(dayKey(d))) d.setDate(d.getDate() - 1);
+    while (days.has(dayKey(d))) { streak += 1; d.setDate(d.getDate() - 1); } }
+
+  const todayLogs = logs.filter(l => dayKey(new Date(l.at)) === today);
+  const todayAgain = todayLogs.filter(l => l.rating === 'again').length;
+
+  const last14 = [];
+  for (let i = 13; i >= 0; i--) {
+    const d = new Date(); d.setDate(d.getDate() - i);
+    const k = dayKey(d);
+    last14.push({ day: k, label: String(d.getDate()), n: byDay[k] || 0, isToday: k === today });
+  }
+
+  const maturity = { fresh: 0, learning: 0, young: 0, mature: 0 };
+  for (const c of allCards(lang)) {
+    const r = state.reviews.get(c.cardId);
+    if (!r || r.state === 'new') maturity.fresh += 1;
+    else if (r.state === 'learning' || r.state === 'relearning') maturity.learning += 1;
+    else if (r.ivl < 21) maturity.young += 1;
+    else maturity.mature += 1;
+  }
+
+  const words = state.sets.filter(s => s.status === 'done' && (lang === 'all' || s.targetLang === lang)).length;
+  return {
+    streak,
+    today: todayLogs.length,
+    todayAccuracy: todayLogs.length ? Math.round((1 - todayAgain / todayLogs.length) * 100) : null,
+    total: logs.length,
+    words,
+    last14, maturity
+  };
+}
+
+function renderStats() {
+  const lang = state.studyLang;
+  $('#statsLangLabel').textContent = lang === 'all' ? 'all languages' : lang;
+  const st = statsFor(lang);
+  const tile = (value, label, sub) =>
+    '<div class="bg-card border border-ink/10 rounded-lg p-4">' +
+      '<div class="font-display font-black text-2xl leading-none">' + value + '</div>' +
+      '<div class="text-xs text-inkfaint mt-1.5">' + label + (sub ? ' <span class="font-mono">' + sub + '</span>' : '') + '</div>' +
+    '</div>';
+
+  const maxN = Math.max(1, ...st.last14.map(d => d.n));
+  const bars = st.last14.map(d =>
+    '<div class="flex-1 flex flex-col items-center gap-1 min-w-0">' +
+      '<span class="text-[9px] font-mono text-inkfaint h-3">' + (d.n || '') + '</span>' +
+      '<div class="w-full flex items-end" style="height:72px;">' +
+        '<div class="bar w-full ' + (d.isToday ? 'bar-today' : '') + '" style="height:' + (d.n ? Math.max(4, Math.round(d.n / maxN * 72)) : 2) + 'px;opacity:' + (d.n ? 1 : .25) + '"></div>' +
+      '</div>' +
+      '<span class="text-[9px] font-mono text-inkfaint">' + d.label + '</span>' +
+    '</div>').join('');
+
+  const m = st.maturity;
+  const mTotal = Math.max(1, m.fresh + m.learning + m.young + m.mature);
+  const seg = (n, color) => n ? '<div style="width:' + (n / mTotal * 100) + '%;background:' + color + '" class="h-full"></div>' : '';
+  const maturityBar =
+    '<div class="h-2.5 rounded-full overflow-hidden flex bg-ink/5">' +
+      seg(m.mature, '#1E8E5A') + seg(m.young, '#2B59C3') + seg(m.learning, '#F5C400') + seg(m.fresh, '#C9D2DD') +
+    '</div>' +
+    '<div class="flex flex-wrap gap-x-4 gap-y-1 mt-2 text-[11px] text-inkfaint font-mono">' +
+      '<span><span class="dot" style="background:#1E8E5A"></span> mature ' + m.mature + '</span>' +
+      '<span><span class="dot" style="background:#2B59C3"></span> young ' + m.young + '</span>' +
+      '<span><span class="dot" style="background:#F5C400"></span> learning ' + m.learning + '</span>' +
+      '<span><span class="dot" style="background:#C9D2DD"></span> new ' + m.fresh + '</span>' +
+    '</div>';
+
+  const langs = langsAvailable();
+  const langRows = langs.length > 1 ? langs.map(l => {
+    const s = statsFor(l);
+    const d = dueCounts(l);
+    return '<tr class="border-t border-ink/10">' +
+      '<td class="py-2 pr-3 font-medium">' + esc(l) + '</td>' +
+      '<td class="py-2 pr-3 font-mono text-inkfaint">' + s.words + '</td>' +
+      '<td class="py-2 pr-3 font-mono text-inkfaint">' + d.total + '</td>' +
+      '<td class="py-2 font-mono text-inkfaint">' + s.total + '</td></tr>';
+  }).join('') : '';
+
+  $('#statsBody').innerHTML =
+    '<div class="grid grid-cols-2 sm:grid-cols-4 gap-3">' +
+      tile('🔥 ' + st.streak, st.streak === 1 ? 'day streak' : 'day streak') +
+      tile(st.today, 'reviews today', st.todayAccuracy !== null ? st.todayAccuracy + '% recalled' : '') +
+      tile(st.total, 'reviews all time') +
+      tile(st.words, 'words forged') +
+    '</div>' +
+    '<div class="bg-card border border-ink/10 rounded-lg p-4">' +
+      '<h3 class="font-display font-bold text-sm mb-3">Reviews — last 14 days</h3>' +
+      '<div class="flex gap-1">' + bars + '</div>' +
+    '</div>' +
+    '<div class="bg-card border border-ink/10 rounded-lg p-4">' +
+      '<h3 class="font-display font-bold text-sm mb-3">Card maturity</h3>' + maturityBar +
+    '</div>' +
+    (langRows ?
+    '<div class="bg-card border border-ink/10 rounded-lg p-4">' +
+      '<h3 class="font-display font-bold text-sm mb-2">Per language</h3>' +
+      '<table class="w-full text-sm"><thead><tr class="text-[11px] uppercase tracking-wider text-inkfaint text-left">' +
+      '<th class="pb-1 pr-3 font-medium">Language</th><th class="pb-1 pr-3 font-medium">Words</th><th class="pb-1 pr-3 font-medium">Due now</th><th class="pb-1 font-medium">Reviews</th></tr></thead>' +
+      '<tbody>' + langRows + '</tbody></table>' +
+    '</div>' : '') +
+    (st.total === 0 ?
+    '<p class="text-center text-sm text-inkfaint py-2">No reviews yet — study your first cards and this page comes alive.</p>' : '');
+}
+
+/* ============================================================
+   GENERATION FLOW
+   ============================================================ */
+async function generateSet(set) {
+  set.status = 'loading';
+  set.progress = 'Writing 6 sentences…';
+  set.error = null;
+  render();
+  try {
+    const data = await callChat(set.word, set.nativeLang, set.targetLang);
+    set.progress = 'Recording audio (0/' + data.sentences.length + ')…';
+    render();
+
+    let done = 0;
+    await Promise.all(data.sentences.map(async s => {
+      s.audio = await callTTS(s.target, set.voice);
+      done += 1;
+      set.progress = 'Recording audio (' + done + '/' + data.sentences.length + ')…';
+      render();
+    }));
+
+    set.data = data;
+    set.status = 'done';
+    set.previewIdx = 0;
+    set.activeDeck = set.activeDeck || 'reading';
+    await persistSet(set, true);
+  } catch (err) {
+    set.status = 'error';
+    set.error = err.message || String(err);
+  }
+  render();
+}
+
+function addWord(word) {
+  const set = {
+    id: uuid(),
+    word,
+    nativeLang: $('#nativeLang').value,
+    targetLang: $('#targetLang').value,
+    voice: $('#voice').value,
+    status: 'loading', progress: '', error: null,
+    previewIdx: 0, activeDeck: 'reading', data: null,
+    createdAt: nowISO(), updatedAt: nowISO(), deleted: false
+  };
+  state.sets.unshift(set);
+  $('#libDetails').open = true;
+  generateSet(set);
+}
+
+async function removeSet(set) {
+  if (!confirm('Delete "' + set.word + '" and its review history everywhere?')) return;
+  set.deleted = true;
+  state.sets = state.sets.filter(s => s.id !== set.id);
+  if (set.status === 'done') {
+    await persistSet(set, false);
+    await deleteSetAudio(set);
+    for (const [cid, r] of [...state.reviews]) {
+      if (r.set_id === set.id) { state.reviews.delete(cid); idbDel('reviews', cid); }
+    }
+  }
+  render();
+}
+
+/* ============================================================
+   ANKI EXPORT — IDENTICAL output to the original app
+   ============================================================ */
+function deckLang() {
+  const langs = [...new Set(state.sets.filter(s => s.status === 'done').map(s => s.targetLang))];
+  return langs.length === 1 && langs[0] ? langs[0] : $('#targetLang').value;
+}
+const deckName = kind => '1.' + deckLang() + ' [' + kind + ']';
+
+function buildReadingDeck() {
+  const name = deckName('Reading');
+  const rows = [];
+  for (const set of state.sets) {
+    if (set.status !== 'done') continue;
+    rows.push(stripField(readingFront(set)) + '\t' + stripField(readingBack(set)));
+  }
+  return {
+    filename: name + '.txt',
+    content: '#separator:tab\n#html:true\n#deck:' + name + '\n#columns:Front\tBack\n' + rows.join('\n')
+  };
+}
+
+function buildListeningDeck() {
+  const name = deckName('Listening');
+  const rows = [];
+  for (const set of state.sets) {
+    if (set.status !== 'done') continue;
+    for (const s of set.data.sentences) {
+      rows.push(stripField(listeningFront(s)) + '\t' + stripField(listeningBack(set, s)));
+    }
+  }
+  return {
+    filename: name + '.txt',
+    content: '#separator:tab\n#html:true\n#deck:' + name + '\n#columns:Front\tBack\n' + rows.join('\n')
+  };
+}
+
+function buildSpeakingDeck() {
+  const name = deckName('Speaking');
+  const rows = [];
+  for (const set of state.sets) {
+    if (set.status !== 'done') continue;
+    for (const s of set.data.sentences) {
+      rows.push(stripField(speakingText(set, s)) + '\t' + stripField(speakingExtra(set, s)));
+    }
+  }
+  return {
+    filename: name + '.txt',
+    content: '#separator:tab\n#html:true\n#notetype:Cloze\n#deck:' + name + '\n#columns:Text\tBack Extra\n' + rows.join('\n')
+  };
+}
+
+function downloadFile(filename, content) {
+  const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = filename;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 4000);
+}
+
+async function exportAll() {
+  const btn = $('#exportBtn');
+  btn.disabled = true;
+  toast('Preparing export — checking audio on this device…', 8000);
+  const missing = [];
+  for (const set of state.sets) {
+    if (set.status !== 'done') continue;
+    const ok = await ensureAudio(set);
+    if (!ok) missing.push(set.word);
+  }
+  if (missing.length &&
+      !confirm('Audio for ' + missing.join(', ') + ' could not be loaded (offline or not yet synced). Export anyway with an "audio unavailable" note on those cards?')) {
+    toast('Export cancelled — go online while signed in and try again.');
+    btn.disabled = false;
+    return;
+  }
+  const decks = [buildReadingDeck(), buildListeningDeck(), buildSpeakingDeck()];
+  decks.forEach((d, i) => setTimeout(() => downloadFile(d.filename, d.content), i * 350));
+  const n = state.sets.filter(s => s.status === 'done').length;
+  toast('✓ Exported ' + n + ' word set' + (n === 1 ? '' : 's') + ' across 3 deck files. Import the Speaking file with the Cloze note type.', 6000);
+  btn.disabled = false;
+}
+
+/* ---------- preview builders (mirror the export HTML exactly) ---------- */
+function previewFaces(set) {
+  const d = set.data;
+  const i = Math.min(set.previewIdx, d.sentences.length - 1);
+  const s = d.sentences[i];
+  const deck = set.activeDeck;
+
+  if (deck === 'reading') {
+    return { pager: false, front: readingFront(set), back: readingBack(set) };
+  }
+  if (deck === 'listening') {
+    return { pager: true, front: listeningFront(s), back: listeningBack(set, s) };
+  }
+  const textRaw  = speakingText(set, s);
+  const clozeRe  = /\{\{c1::([\s\S]*?)::([\s\S]*?)\}\}/g;
+  return {
+    pager: true,
+    front: textRaw.replace(clozeRe, '<span class="cloze-blank">[…$2…]</span>'),
+    back:  textRaw.replace(clozeRe, '$1') + speakingExtra(set, s)
+  };
+}
+
+/* ---------- rendering ---------- */
+const DECK_META = {
+  reading:   { label: 'Reading',   note: '1 card per word · all 6 sentences on the front' },
+  listening: { label: 'Listening', note: '6 cards per word · audio-only front' },
+  speaking:  { label: 'Speaking',  note: '6 cloze cards per word · say the missing word' }
+};
+
+function setCardHTML(set) {
+  const header =
+    '<div class="flex items-center gap-3 flex-wrap">' +
+      '<span class="hl font-display font-bold text-lg">' + esc(set.word) + '</span>' +
+      '<span class="text-xs font-mono text-inkfaint">' + esc(set.targetLang) + ' → ' + esc(set.nativeLang) + '</span>' +
+      '<span class="ml-auto flex items-center gap-2">' +
+        '<button data-act="regen" data-id="' + set.id + '" class="inline-flex items-center gap-1.5 text-xs font-medium border border-ink/20 rounded-md px-2.5 py-1.5 hover:bg-paper" ' + (set.status === 'loading' ? 'disabled' : '') + '>' +
+          '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>' +
+          'Regenerate</button>' +
+        '<button data-act="remove" data-id="' + set.id + '" class="text-xs font-medium text-danger border border-danger/30 rounded-md px-2.5 py-1.5 hover:bg-danger/5">Remove</button>' +
+      '</span>' +
+    '</div>';
+
+  let body = '';
+
+  if (set.status === 'loading') {
+    body =
+      '<div class="flex items-center gap-3 mt-4 text-sm text-inkfaint" role="status">' +
+        '<svg class="spin text-action" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" aria-hidden="true"><circle cx="12" cy="12" r="9" opacity=".2"/><path d="M21 12a9 9 0 0 0-9-9" stroke-linecap="round"/></svg>' +
+        esc(set.progress || 'Working…') +
+      '</div>';
+  } else if (set.status === 'error') {
+    body =
+      '<div class="mt-4 text-sm text-danger bg-danger/5 border border-danger/20 rounded-md px-3 py-2.5" role="alert">' +
+        esc(set.error) +
+      '</div>';
+  } else {
+    const faces = previewFaces(set);
+    const tabs = DECKS.map(d =>
+      '<button data-act="tab" data-id="' + set.id + '" data-deck="' + d + '" ' +
+      'class="px-3 py-1.5 text-xs font-display font-bold rounded-md ' +
+      (set.activeDeck === d ? 'bg-ink text-white' : 'text-inkfaint hover:bg-ink/5') + '">' +
+      DECK_META[d].label + '</button>').join('');
+
+    const pager = faces.pager
+      ? '<div class="flex items-center gap-2 ml-auto">' +
+          '<button data-act="prev" data-id="' + set.id + '" class="w-7 h-7 grid place-items-center border border-ink/20 rounded-md hover:bg-paper" aria-label="Previous sentence">‹</button>' +
+          '<span class="text-xs font-mono text-inkfaint">sentence ' + (set.previewIdx + 1) + '/' + set.data.sentences.length + '</span>' +
+          '<button data-act="next" data-id="' + set.id + '" class="w-7 h-7 grid place-items-center border border-ink/20 rounded-md hover:bg-paper" aria-label="Next sentence">›</button>' +
+        '</div>'
+      : '<span class="ml-auto text-xs font-mono text-inkfaint">1 card</span>';
+
+    body =
+      '<div class="flex items-center gap-1 mt-4 flex-wrap">' + tabs + pager + '</div>' +
+      '<p class="text-[11px] text-inkfaint mt-1.5">' + DECK_META[set.activeDeck].note + '</p>' +
+      '<div class="grid md:grid-cols-2 gap-3 mt-2 preview">' +
+        '<div class="rounded-lg border border-ink/10 bg-[#EDF0F5] overflow-hidden">' +
+          '<div class="px-3 py-1.5 text-[10px] font-mono uppercase tracking-widest text-inkfaint border-b border-ink/10 bg-white/60">Front — as shown in Anki</div>' +
+          '<div class="p-3 text-[15px] leading-relaxed">' + faces.front + '</div>' +
+        '</div>' +
+        '<div class="rounded-lg border border-ink/10 bg-[#EDF0F5] overflow-hidden">' +
+          '<div class="px-3 py-1.5 text-[10px] font-mono uppercase tracking-widest text-inkfaint border-b border-ink/10 bg-white/60">Back — as shown in Anki</div>' +
+          '<div class="p-3 text-[15px] leading-relaxed">' + faces.back + '</div>' +
+        '</div>' +
+      '</div>';
+  }
+
+  return '<article class="bg-card border border-ink/10 rounded-lg p-4 sm:p-5">' + header + body + '</article>';
+}
+
+/* hero + language chips */
+function updateHero() {
+  const langs = langsAvailable();
+  if (state.studyLang !== 'all' && !langs.includes(state.studyLang)) state.studyLang = 'all';
+
+  // chips only when there is a real choice
+  const chipsEl = $('#langChips');
+  if (langs.length > 1) {
+    const chip = (lang, label) => {
+      const active = state.studyLang === lang;
+      const n = dueCounts(lang).total;
+      return '<button data-lang="' + esc(lang) + '" class="lang-chip text-xs font-display font-bold px-3 py-1.5 rounded-full ' +
+        (active ? 'bg-mark text-ink' : 'bg-white/10 text-white/80 hover:bg-white/20') + '">' +
+        label + (n ? ' <span class="font-mono font-normal opacity-70">' + n + '</span>' : '') + '</button>';
+    };
+    chipsEl.innerHTML = chip('all', 'All') + langs.map(l => chip(l, esc(l))).join('');
+    chipsEl.classList.remove('hidden');
+  } else {
+    chipsEl.innerHTML = '';
+    chipsEl.classList.add('hidden');
+    state.studyLang = 'all';
+  }
+
+  const c = dueCounts(state.studyLang);
+  const st = statsFor(state.studyLang);
+  const anyCards = allCards(state.studyLang).length > 0;
+  const weekday = new Date().toLocaleDateString(undefined, { weekday: 'long' });
+  $('#heroMeta').textContent = weekday
+    + (st.streak ? ' · 🔥 ' + st.streak + '-day streak' : '')
+    + (st.today ? ' · ' + st.today + ' review' + (st.today === 1 ? '' : 's') + ' today' : '');
+
+  if (!anyCards) {
+    $('#heroTitle').textContent = 'Forge your first cards';
+    $('#heroSub').textContent = 'Type a word below — six natural sentences with audio, ready to study in seconds.';
+  } else if (c.total === 0) {
+    const next = nextDueAt(state.studyLang);
+    $('#heroTitle').textContent = 'All caught up ✨';
+    $('#heroSub').textContent = next ? 'Next card due in ' + fmtDue(next.toISOString()) + '. Add a new word or come back later.' : 'Add a new word or come back later.';
+  } else {
+    $('#heroTitle').textContent = c.total + ' card' + (c.total === 1 ? '' : 's') + ' ready';
+    $('#heroSub').textContent = c.learn + ' learning · ' + c.due + ' review · ' + c.fresh + ' new';
+  }
+  $('#studyBtn').disabled = c.total === 0;
+}
+
+function render() {
+  const list = $('#setList');
+  list.innerHTML = state.sets.map(setCardHTML).join('');
+
+  const total = state.sets.length;
+  const ready = state.sets.filter(s => s.status === 'done').length;
+  $('#emptyState').classList.toggle('hidden', total > 0);
+  $('#libCount').textContent = total + ' word' + (total === 1 ? '' : 's') + (ready < total ? ' (' + ready + ' ready)' : '');
+  $('#exportBtn').disabled = ready === 0;
+  updateHero();
+}
+
+/* ---------- boot ---------- */
+async function loadLocal() {
+  _db = await idbOpen();
+  const meta = await idbGet('meta', 'meta');
+  if (meta) state.meta = { lastSync: null, pending: [], newIntro: null, ...meta };
+  // migrate v1 newIntro shape {day,n} -> {day,byLang}
+  if (state.meta.newIntro && typeof state.meta.newIntro.n === 'number') {
+    state.meta.newIntro = { day: state.meta.newIntro.day, byLang: {} };
+  }
+  const sets = await idbAll('sets');
+  state.sets = (sets || [])
+    .filter(s => !s.deleted)
+    .map(s => ({ ...s, status: 'done', error: null, previewIdx: 0, activeDeck: 'reading' }))
+    .sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
+  const revs = await idbAll('reviews');
+  for (const r of revs || []) state.reviews.set(r.card_id, r);
+  const logs = await idbAll('revlog');
+  for (const l of logs || []) state.revlog.set(l.id, l);
+}
+
+/* ---------- events ---------- */
+function openOverlay(sel)  { $(sel).classList.remove('hidden'); document.body.style.overflow = 'hidden'; }
+function closeOverlay(sel) { $(sel).classList.add('hidden');    document.body.style.overflow = ''; }
+
+function init() {
+  for (const [id, def] of [['#nativeLang','Turkish'], ['#targetLang','English']]) {
+    const sel = $(id);
+    sel.innerHTML = LANGUAGES.map(l => '<option' + (l === def ? ' selected' : '') + '>' + l + '</option>').join('');
+  }
+
+  // remembered settings — once entered they stay on this device
+  const savedKey = safeStore('get', 'wordstack.apiKey');
+  if (savedKey) { $('#apiKey').value = savedKey; $('#rememberKey').checked = true; }
+  $('#sbUrl').value = cfg.sbUrl;
+  $('#sbKey').value = cfg.sbKey;
+  $('#newPerDay').value = cfg.newPerDay;
+  state.studyLang = safeStore('get', 'wordstack.studyLang') || 'all';
+  for (const [sel, key] of [['#nativeLang','wordstack.nativeLang'], ['#targetLang','wordstack.targetLang'], ['#voice','wordstack.voice']]) {
+    const saved = safeStore('get', key);
+    if (saved) $(sel).value = saved;
+    $(sel).addEventListener('change', e => safeStore('set', key, e.target.value));
+  }
+
+  $('#rememberKey').addEventListener('change', e => {
+    if (e.target.checked) safeStore('set', 'wordstack.apiKey', apiKey());
+    else safeStore('remove', 'wordstack.apiKey');
+  });
+  $('#apiKey').addEventListener('input', () => {
+    if ($('#rememberKey').checked) safeStore('set', 'wordstack.apiKey', apiKey());
+  });
+  $('#toggleKey').addEventListener('click', () => {
+    const inp = $('#apiKey');
+    const show = inp.type === 'password';
+    inp.type = show ? 'text' : 'password';
+    $('#toggleKey').textContent = show ? 'Hide' : 'Show';
+  });
+  $('#sbUrl').addEventListener('change', e => { safeStore('set', 'wordstack.sbUrl', e.target.value.trim()); initSupa(); });
+  $('#sbKey').addEventListener('change', e => { safeStore('set', 'wordstack.sbKey', e.target.value.trim()); initSupa(); });
+  $('#newPerDay').addEventListener('change', e => { safeStore('set', 'wordstack.newPerDay', e.target.value); updateHero(); });
+
+  // overlays
+  $('#settingsBtn').addEventListener('click', () => openOverlay('#settingsOverlay'));
+  $('#settingsClose').addEventListener('click', () => closeOverlay('#settingsOverlay'));
+  $('#statsBtn').addEventListener('click', () => { renderStats(); openOverlay('#statsOverlay'); });
+  $('#statsClose').addEventListener('click', () => closeOverlay('#statsOverlay'));
+
+  // auth
+  const authErr = msg => { const el = $('#authError'); el.textContent = msg; el.classList.toggle('hidden', !msg); };
+  $('#signInBtn').addEventListener('click', async () => {
+    authErr('');
+    if (!supa) initSupa();
+    if (!supa) { authErr('Add your Supabase project URL and anon key first.'); return; }
+    const { error } = await supa.auth.signInWithPassword({ email: $('#sbEmail').value.trim(), password: $('#sbPass').value });
+    if (error) authErr(error.message);
+  });
+  $('#signUpBtn').addEventListener('click', async () => {
+    authErr('');
+    if (!supa) initSupa();
+    if (!supa) { authErr('Add your Supabase project URL and anon key first.'); return; }
+    const { error } = await supa.auth.signUp({ email: $('#sbEmail').value.trim(), password: $('#sbPass').value });
+    if (error) authErr(error.message);
+    else authErr('Account created. If email confirmation is on in Supabase, confirm it, then Sign in.');
+  });
+  $('#signOutBtn').addEventListener('click', async () => { if (supa) await supa.auth.signOut(); });
+  $('#syncNowBtn').addEventListener('click', () => syncNow());
+
+  // word form
+  $('#wordForm').addEventListener('submit', e => {
+    e.preventDefault();
+    const errEl = $('#formError');
+    errEl.classList.add('hidden');
+    const word = $('#wordInput').value.trim();
+    if (!apiKey())      { errEl.textContent = 'Add your OpenAI API key first — it\'s under ⚙ Settings (top right), saved once per device.'; errEl.classList.remove('hidden'); openOverlay('#settingsOverlay'); return; }
+    if (!word)          { errEl.textContent = 'Type a word or phrase to generate cards for.'; errEl.classList.remove('hidden'); return; }
+    if ($('#nativeLang').value === $('#targetLang').value) {
+      errEl.textContent = 'Native and target language are the same — pick two different languages in Settings.';
+      errEl.classList.remove('hidden'); return;
+    }
+    $('#wordInput').value = '';
+    addWord(word);
+  });
+
+  document.addEventListener('click', e => {
+    // language chips
+    const chip = e.target.closest('#langChips [data-lang]');
+    if (chip) {
+      state.studyLang = chip.dataset.lang;
+      safeStore('set', 'wordstack.studyLang', state.studyLang);
+      updateHero();
+      return;
+    }
+    const btn = e.target.closest('button[data-act]');
+    if (!btn) return;
+    const set = state.sets.find(s => s.id === btn.dataset.id);
+    if (!set) return;
+    const act = btn.dataset.act;
+    if (act === 'regen')  { set.data = null; generateSet(set); }
+    if (act === 'remove') { removeSet(set); }
+    if (act === 'tab')    {
+      set.activeDeck = btn.dataset.deck;
+      render();
+      if (btn.dataset.deck !== 'reading') ensureAudio(set).then(() => render());
+    }
+    if (act === 'prev')   { set.previewIdx = (set.previewIdx - 1 + set.data.sentences.length) % set.data.sentences.length; render(); }
+    if (act === 'next')   { set.previewIdx = (set.previewIdx + 1) % set.data.sentences.length; render(); }
+  });
+
+  // export (header icon)
+  $('#exportBtn').addEventListener('click', exportAll);
+
+  // study
+  $('#studyBtn').addEventListener('click', startStudy);
+  $('#showAnswerBtn').addEventListener('click', revealAnswer);
+  $('#studyClose').addEventListener('click', closeStudy);
+  $('#studyDoneClose').addEventListener('click', closeStudy);
+  document.querySelectorAll('#ratingBar [data-rate]').forEach(b =>
+    b.addEventListener('click', () => rateCard(b.dataset.rate)));
+  document.addEventListener('keydown', e => {
+    if (e.key === 'Escape') {
+      if (!$('#statsOverlay').classList.contains('hidden'))    { closeOverlay('#statsOverlay'); return; }
+      if (!$('#settingsOverlay').classList.contains('hidden')) { closeOverlay('#settingsOverlay'); return; }
+      if (!$('#studyOverlay').classList.contains('hidden'))    { closeStudy(); return; }
+    }
+    if (!state.studying || $('#studyOverlay').classList.contains('hidden')) return;
+    if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT' || e.target.tagName === 'TEXTAREA') return;
+    if (e.key === ' ') {
+      e.preventDefault();
+      if ($('#ratingBar').classList.contains('hidden')) revealAnswer();
+      else rateCard('good');
+    }
+    const map = { '1': 'again', '2': 'hard', '3': 'good', '4': 'easy' };
+    if (map[e.key] && !$('#ratingBar').classList.contains('hidden')) rateCard(map[e.key]);
+  });
+
+  // connectivity → sync
+  window.addEventListener('online', () => scheduleSync(500));
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) scheduleSync(500); });
+  setInterval(updateHero, 60000);
+
+  render();
+  updateAuthUI();
+  initSupa();
+
+  // first-run onboarding: no key + no words -> open settings
+  if (!savedKey && state.sets.length === 0) openOverlay('#settingsOverlay');
+
+  if ('serviceWorker' in navigator && location.protocol.startsWith('http')) {
+    navigator.serviceWorker.register('./sw.js').catch(() => {});
+  }
+}
+
+document.addEventListener('DOMContentLoaded', async () => {
+  try { await loadLocal(); } catch (e) { console.warn('IndexedDB unavailable:', e); }
+  init();
+});
+</script>
+</body>
+</html>
