@@ -345,6 +345,12 @@ function newLearnerId() {
   return 'learner_' + rand;
 }
 
+function missingIslandTables(error) {
+  const msg = (error && error.message ? error.message : String(error || '')).toLowerCase();
+  return (msg.indexOf('islands') !== -1 || msg.indexOf('island_stages') !== -1) &&
+    (msg.indexOf('does not exist') !== -1 || msg.indexOf('schema cache') !== -1);
+}
+
 function missingSrsTables(error) {
   const msg = (error && error.message ? error.message : String(error || '')).toLowerCase();
   return (msg.indexOf('vocab_sets') !== -1 || msg.indexOf('srs_reviews') !== -1 || msg.indexOf('srs_revlog') !== -1) &&
@@ -444,8 +450,8 @@ async function verifyOpenAIKey(apiKey) {
 // and plays the model's audio back through an <audio> element, so there is no
 // record -> upload -> synthesize round trip. Turn taking is done server side by
 // voice activity detection, which also handles barge-in.
-function buildRealtimeSession(profile, topic, vocab, voice) {
-  const base = buildSystemPrompt(profile, topic, vocab);
+function buildRealtimeSession(profile, topic, vocab, voice, stage) {
+  const base = buildSystemPrompt(profile, topic, vocab, stage);
   const realtimeRules = [
     '',
     'THIS IS A LIVE SPOKEN CALL:',
@@ -581,6 +587,182 @@ async function connectRealtime(apiKey, sessionConfig, handlers) {
     teardown();
     throw err;
   }
+}
+
+/* ----------------------------------------------------------- language islands */
+
+// A language island is a domain the learner wants to own outright — their job,
+// their city, the argument they keep having. The learner picks the island; the
+// model designs the roadmap that builds it, stage by stage.
+const ISLAND_STAGES_TARGET = 10;
+
+const ISLAND_SEEDS = [
+  'My work and what I actually do all day',
+  'Where I am from and what the place is like',
+  'My family and the people close to me',
+  'The thing I do at weekends',
+  'Getting through everyday errands and admin',
+  'My opinions on something I care about'
+];
+
+async function generateIslandRoadmap(apiKey, profile, islandName, aboutYou, weakSpots) {
+  const weakness = (weakSpots && weakSpots.length)
+    ? 'Recent recorded weaknesses to design around:\n' + weakSpots.map(w => '- ' + w).join('\n')
+    : 'No recorded weaknesses yet: assume the level is exactly CEFR ' + profile.current_cefr + '.';
+
+  const about = (aboutYou && aboutYou.trim())
+    ? 'What the learner told you about themselves:\n"""\n' + aboutYou.trim() + '\n"""'
+    : 'The learner gave no personal detail, so keep the island widely usable but still concrete.';
+
+  const raw = await chatCompletion(apiKey, [
+    {
+      role: 'system',
+      content: 'You design speaking curricula built on Boris Shekhtman\'s "language islands": prepared, ' +
+        'rehearsed blocks of speech a learner can deliver fluently on the subjects that keep coming up in their ' +
+        'own life. You always reply with a single valid JSON object and nothing else.'
+    },
+    {
+      role: 'user',
+      content: [
+        'Target language: ' + profile.target_language,
+        'Learner level: CEFR ' + profile.current_cefr,
+        'The island the learner chose to own: "' + islandName + '"',
+        '',
+        about,
+        '',
+        weakness,
+        '',
+        'Design a roadmap of EXACTLY ' + ISLAND_STAGES_TARGET + ' stages that takes this learner from wherever ' +
+          'they are now to being able to hold this island fluently, without hesitation, in real conversation.',
+        '',
+        'What makes this a roadmap rather than a list of topics:',
+        '- Order the stages so difficulty climbs steadily and each one is speakable at CEFR ' + profile.current_cefr + '.',
+        '- Every stage after the first must reuse phrases from earlier stages: name those positions in ' +
+          '"recycles_from". Recycling is what makes the island stick, so be deliberate about it.',
+        '- Early stages are the load-bearing ones the learner will use in every single conversation. Later stages ' +
+          'handle the harder, less predictable turns: disagreeing, telling a story with a point, handling a ' +
+          'question they did not expect.',
+        '- Ground every stage in the learner\'s actual life as described above. Specific beats generic: ' +
+          '"explaining a deployment that went wrong" beats "talking about problems at work".',
+        '',
+        'Return ONLY a JSON object of this exact shape:',
+        '{',
+        '  "goal": "one sentence, in English, on what owning this island will let the learner do",',
+        '  "stages": [',
+        '    {',
+        '      "position": 1,',
+        '      "title": "short name for the stage, in English",',
+        '      "objective": "the concrete thing they must be able to say, in English, one sentence",',
+        '      "scenario": "the situation to practise it in, in English, one sentence",',
+        '      "structures": ["grammar or patterns to lean on, in English, 1-3 items"],',
+        '      "phrases": [',
+        '        { "phrase": "the chunk in ' + profile.target_language + '", "translation": "English", "note": "when to reach for it" }',
+        '      ],',
+        '      "done_when": "an observable test the learner passes, in English, one sentence",',
+        '      "recycles_from": [1, 2]',
+        '    }',
+        '  ]',
+        '}',
+        '',
+        'Rules:',
+        '- EXACTLY ' + ISLAND_STAGES_TARGET + ' stages, positions 1 to ' + ISLAND_STAGES_TARGET + ' in order.',
+        '- 4 to 6 phrases per stage. Phrases are multi-word chunks a native would actually say, never single words.',
+        '- "recycles_from" is an array of earlier positions, empty only for position 1.',
+        '- "done_when" must be observable from a spoken conversation, not a feeling.',
+        '- Output raw JSON only, no markdown fences, no commentary.'
+      ].join('\n')
+    }
+  ], { json: true, temperature: 0.7, maxTokens: 4000 });
+
+  const cleaned = raw.replace(/^```(?:json)?/i, '').replace(/```$/, '').trim();
+  const parsed = JSON.parse(cleaned);
+  if (!Array.isArray(parsed.stages) || !parsed.stages.length) {
+    throw new Error('The model returned no stages.');
+  }
+
+  const stages = parsed.stages
+    .slice(0, ISLAND_STAGES_TARGET)
+    .map((st, i) => ({
+      position: i + 1,
+      title: String(st.title || ('Stage ' + (i + 1))).trim(),
+      objective: String(st.objective || '').trim(),
+      scenario: String(st.scenario || '').trim(),
+      structures: Array.isArray(st.structures) ? st.structures.map(String) : [],
+      phrases: (Array.isArray(st.phrases) ? st.phrases : [])
+        .filter(p => p && p.phrase)
+        .map(p => ({
+          phrase: String(p.phrase).trim(),
+          translation: p.translation ? String(p.translation).trim() : '',
+          note: p.note ? String(p.note).trim() : ''
+        })),
+      done_when: String(st.done_when || '').trim(),
+      recycles_from: Array.isArray(st.recycles_from)
+        ? st.recycles_from.map(n => parseInt(n, 10)).filter(n => Number.isInteger(n) && n >= 1 && n <= i)
+        : []
+    }));
+
+  return { goal: String(parsed.goal || '').trim(), stages: stages };
+}
+
+// Suggest islands worth owning, given who the learner is.
+async function suggestIslands(apiKey, profile, aboutYou) {
+  const raw = await chatCompletion(apiKey, [
+    {
+      role: 'system',
+      content: 'You help language learners choose which "language island" to build next. ' +
+        'You always reply with a single valid JSON object and nothing else.'
+    },
+    {
+      role: 'user',
+      content: [
+        'Target language: ' + profile.target_language + '. Level: CEFR ' + profile.current_cefr + '.',
+        aboutYou && aboutYou.trim()
+          ? 'About the learner:\n"""\n' + aboutYou.trim() + '\n"""'
+          : 'The learner has told you nothing about themselves yet.',
+        '',
+        'Propose 4 islands: subjects this learner will genuinely have to speak about again and again, ' +
+          'worth rehearsing until they are automatic. Ground them in the learner\'s real life where you know it.',
+        '',
+        'Return ONLY: { "islands": [ { "name": "short island name", "why": "one sentence on why it earns the effort" } ] }',
+        'Output raw JSON only, no fences.'
+      ].join('\n')
+    }
+  ], { json: true, temperature: 0.8, maxTokens: 800 });
+
+  const cleaned = raw.replace(/^```(?:json)?/i, '').replace(/```$/, '').trim();
+  const parsed = JSON.parse(cleaned);
+  return (Array.isArray(parsed.islands) ? parsed.islands : [])
+    .filter(i => i && i.name)
+    .map(i => ({ name: String(i.name).trim(), why: i.why ? String(i.why).trim() : '' }));
+}
+
+// A stage is only finished when the analysis says the objective was met AND
+// every phrase it introduced has been genuinely used in conversation.
+function stageGate(stage, vocabRows) {
+  const phrases = Array.isArray(stage.phrases) ? stage.phrases : [];
+  const byPhrase = new Map();
+  (vocabRows || []).forEach(v => byPhrase.set(normalizeText(v.phrase), v));
+
+  let mastered = 0;
+  const outstanding = [];
+  phrases.forEach(p => {
+    const row = byPhrase.get(normalizeText(p.phrase));
+    if (row && row.status === 'mastered') mastered += 1;
+    else outstanding.push({
+      phrase: p.phrase,
+      uses: row ? (row.times_reviewed || 0) : 0
+    });
+  });
+
+  const vocabDone = phrases.length > 0 && mastered === phrases.length;
+  return {
+    total: phrases.length,
+    mastered: mastered,
+    outstanding: outstanding,
+    vocabDone: vocabDone,
+    aiDone: !!stage.ai_verdict,
+    complete: vocabDone && !!stage.ai_verdict
+  };
 }
 
 /* -------------------------------------------------------------- daily stats */
@@ -902,7 +1084,7 @@ function downloadFile(filename, mimeType, content) {
 
 /* ------------------------------------------------------------ prompt builders */
 
-function buildSystemPrompt(profile, topic, vocab) {
+function buildSystemPrompt(profile, topic, vocab, stage) {
   const lang = profile.target_language;
   const level = profile.current_cefr;
   const forceVerbatim = profile.vocab_injection_mode === 'force_verbatim';
@@ -928,6 +1110,19 @@ function buildSystemPrompt(profile, topic, vocab) {
     : 'The learner has no active target phrases yet. Introduce useful, level-appropriate everyday expressions ' +
       'naturally and give the learner reasons to reuse them.';
 
+  const stageBlock = stage ? [
+    '',
+    'THIS SESSION BELONGS TO A LANGUAGE ISLAND THE LEARNER IS BUILDING.',
+    'Stage: ' + stage.title,
+    'What they must be able to do by the end: ' + (stage.objective || '—'),
+    'Play this situation: ' + (stage.scenario || topic),
+    (Array.isArray(stage.structures) && stage.structures.length
+      ? 'Give them room to use these structures: ' + stage.structures.join('; ') + '.'
+      : ''),
+    'Steer the conversation so the learner has to produce the stage phrases themselves, repeatedly and naturally. ' +
+      'Ask questions that can only really be answered using them. Do not lecture about the stage or mention it exists.'
+  ].filter(Boolean).join('\n') : '';
+
   return [
     'You are a warm, curious native ' + lang + ' speaker having a real spoken conversation with a language learner.',
     '',
@@ -947,12 +1142,13 @@ function buildSystemPrompt(profile, topic, vocab) {
     '',
     'CONVERSATION TOPIC: ' + topic,
     'Stay on this topic, but follow interesting tangents the learner opens as long as they keep talking.',
+    stageBlock,
     '',
     vocabBlock
   ].join('\n');
 }
 
-function buildAnalysisPrompt(profile, topic, transcript, activeVocab) {
+function buildAnalysisPrompt(profile, topic, transcript, activeVocab, stage) {
   const lines = transcript.map(m => (m.role === 'user' ? 'LEARNER: ' : 'PARTNER: ') + m.content).join('\n');
   const activeList = (activeVocab || []).map(v => '- ' + v.phrase).join('\n');
   return [
@@ -974,7 +1170,9 @@ function buildAnalysisPrompt(profile, topic, transcript, activeVocab) {
     '  ],',
     '  "next_topic_recommendation": "string",',
     '  "cefr_level_feedback": "string",',
-    '  "used_target_phrases": ["string"]',
+    '  "used_target_phrases": ["string"],',
+    '  "stage_goal_met": true,',
+    '  "stage_evidence": "string"',
     '}',
     '',
     'Rules for the fields:',
@@ -995,6 +1193,13 @@ function buildAnalysisPrompt(profile, topic, transcript, activeVocab) {
         'split it, changed its tense, or made a small error in it. Do not count phrases only the PARTNER said. ' +
         'Do not invent phrases that are not in the list. If none were used, return an empty array.'
       : '- "used_target_phrases": return an empty array, the learner has no active target phrases.',
+    stage
+      ? '- "stage_goal_met" and "stage_evidence": this session was part of a language island. The stage objective ' +
+        'was: "' + (stage.objective || stage.title) + '". It counts as met when: "' + (stage.done_when || 'the learner ' +
+        'achieved the objective unaided') + '". Judge STRICTLY from the transcript, on what the LEARNER produced, not ' +
+        'on what the partner said. Set "stage_goal_met" true only if the transcript really shows it, and quote the ' +
+        'learner\'s own words in "stage_evidence" (one sentence). If it was not met, say what is still missing.'
+      : '- "stage_goal_met": false, and "stage_evidence": "" — this session was not part of an island.',
     'Output raw JSON only, with no markdown fences and no commentary.'
   ].join('\n');
 }
@@ -1795,6 +2000,39 @@ create table if not exists public.srs_revlog (
   at timestamptz not null default now()
 );
 
+-- Language islands: the learner picks the island, the model plans the roadmap.
+create table if not exists public.islands (
+  id uuid primary key default gen_random_uuid(),
+  user_id text not null default 'default_user',
+  target_language text not null default 'German',
+  name text not null, goal text, about_you text,
+  status text not null default 'active',
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+create unique index if not exists islands_one_active
+  on public.islands (user_id, target_language) where status = 'active';
+
+create table if not exists public.island_stages (
+  id uuid primary key default gen_random_uuid(),
+  island_id uuid not null references public.islands(id) on delete cascade,
+  user_id text not null default 'default_user',
+  target_language text not null default 'German',
+  position int not null, title text not null,
+  objective text, scenario text, structures jsonb, phrases jsonb,
+  done_when text, recycles_from jsonb,
+  status text not null default 'locked',
+  ai_verdict boolean not null default false,
+  seeded boolean not null default false,
+  sessions_count int not null default 0,
+  completed_at timestamptz,
+  created_at timestamptz not null default now()
+);
+create unique index if not exists island_stages_position
+  on public.island_stages (island_id, position);
+
+alter table public.conversations add column if not exists stage_id uuid;
+
 -- Upgrading an older database? The repo carries both migrations under
 -- supabase/migrations, so "supabase db push" applies them in order.`;
 
@@ -2077,6 +2315,195 @@ function ForgeSheet({ pending, total, busy, progress, onForge, onClose }) {
             Roughly a cent or two per phrase for the sentences and audio.
           </p>
         </div>
+      </div>
+    </div>
+  );
+}
+
+function IslandSheet({
+  island, stages, vocab, busy, note, onCreate, onAdvance, onArchive, onClose, targetLanguage, cefr
+}) {
+  const [name, setName] = useState('');
+  const [about, setAbout] = useState(island ? (island.about_you || '') : '');
+  const [expanded, setExpanded] = useState(null);
+
+  const current = stages.find(s => s.status === 'current') || null;
+  const doneCount = stages.filter(s => s.status === 'done').length;
+  const gate = current ? stageGate(current, vocab) : null;
+
+  return (
+    <div className="fixed inset-0 z-40 flex flex-col justify-end">
+      <div className="fade-in absolute inset-0 bg-black/60 backdrop-blur-sm" onClick={busy ? undefined : onClose} />
+      <div className="sheet-up relative flex max-h-[90vh] flex-col rounded-t-3xl border-t border-gray-700 bg-gray-900 shadow-2xl">
+        <div className="mx-auto mt-3 h-1.5 w-10 shrink-0 rounded-full bg-gray-700" />
+
+        <div className="mx-auto w-full max-w-md px-5 pt-4">
+          <div className="flex items-center justify-between">
+            <h2 className="text-lg font-semibold tracking-tight">{island ? 'Your island' : 'Build an island'}</h2>
+            <button onClick={onClose} disabled={busy}
+              className="no-tap rounded-lg p-1.5 text-gray-400 transition hover:text-white disabled:opacity-40" aria-label="Close">
+              <svg className="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+                <path d="M18 6 6 18M6 6l12 12" />
+              </svg>
+            </button>
+          </div>
+          {island ? (
+            <p className="mt-1 text-sm text-gray-400">{island.name} · {doneCount}/{stages.length} stages</p>
+          ) : (
+            <p className="mt-1 text-sm text-gray-400">
+              Pick a subject you keep having to speak about. The roadmap that gets you there is designed for you.
+            </p>
+          )}
+        </div>
+
+        <div className="mx-auto w-full max-w-md flex-1 overflow-y-auto px-5 pb-4 pt-4">
+          {!island ? (
+            <div className="space-y-4">
+              <Field label="The island" hint="Concrete beats broad — “my job as a nurse” over “work”.">
+                <input className={inputClass} type="text" value={name} disabled={busy}
+                  onChange={e => setName(e.target.value)}
+                  placeholder={'What do you want to own in ' + targetLanguage + '?'} />
+              </Field>
+
+              <div className="flex flex-wrap gap-1.5">
+                {ISLAND_SEEDS.map(seed => (
+                  <button key={seed} type="button" onClick={() => setName(seed)} disabled={busy}
+                    className="no-tap rounded-lg border border-gray-700 bg-gray-800 px-2.5 py-1 text-xs text-gray-300 transition hover:border-gray-600 hover:text-white disabled:opacity-40">
+                    {seed}
+                  </button>
+                ))}
+              </div>
+
+              <Field label="About you" hint="Two or three sentences. This is what makes the roadmap yours rather than generic.">
+                <textarea className={inputClass + ' h-28 resize-none'} value={about} disabled={busy}
+                  onChange={e => setAbout(e.target.value)}
+                  placeholder="e.g. Backend developer in Berlin, two kids, climb at weekends. I mostly talk to colleagues and my neighbours." />
+              </Field>
+
+              <div className="rounded-xl border border-gray-800 bg-gray-800/40 p-3.5 text-xs leading-relaxed text-gray-400">
+                You will get {ISLAND_STAGES_TARGET} stages at CEFR {cefr}, ordered so each one reuses the phrases from
+                the ones before it. Each stage becomes a session topic, and its phrases go into your vocabulary when
+                you reach it.
+              </div>
+            </div>
+          ) : (
+            <div className="space-y-3">
+              {island.goal ? (
+                <div className="rounded-xl border border-indigo-500/40 bg-indigo-500/10 p-3.5">
+                  <div className="mb-1 text-[11px] font-semibold uppercase tracking-wider text-indigo-300">The goal</div>
+                  <p className="text-sm leading-relaxed text-gray-200">{island.goal}</p>
+                </div>
+              ) : null}
+
+              {stages.map(st => {
+                const isCurrent = st.status === 'current';
+                const isDone = st.status === 'done';
+                const open = expanded === st.id;
+                return (
+                  <div key={st.id}
+                    className={'rounded-xl border transition ' + (isCurrent
+                      ? 'border-indigo-500 bg-indigo-500/10'
+                      : isDone ? 'border-gray-800 bg-gray-800/30' : 'border-gray-800 bg-gray-800/50')}>
+                    <button type="button" onClick={() => setExpanded(open ? null : st.id)}
+                      className="no-tap flex w-full items-start gap-3 p-3.5 text-left">
+                      <span className={'mt-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded-full text-[11px] font-semibold ' + (isDone
+                        ? 'bg-emerald-500/20 text-emerald-300'
+                        : isCurrent ? 'bg-indigo-500 text-white' : 'bg-gray-700 text-gray-400')}>
+                        {isDone ? '✓' : st.position}
+                      </span>
+                      <span className="min-w-0 flex-1">
+                        <span className={'block text-sm font-medium ' + (isDone ? 'text-gray-400' : 'text-white')}>
+                          {st.title}
+                        </span>
+                        <span className="mt-0.5 block text-xs text-gray-500">
+                          {isCurrent ? 'In progress' : isDone ? 'Done' : 'Locked'}
+                          {Array.isArray(st.phrases) ? ' · ' + st.phrases.length + ' phrases' : ''}
+                        </span>
+                      </span>
+                    </button>
+
+                    {open ? (
+                      <div className="border-t border-gray-700/60 px-3.5 py-3 text-xs leading-relaxed text-gray-400">
+                        {st.objective ? <p className="text-gray-300">{st.objective}</p> : null}
+                        {st.scenario ? <p className="mt-1.5">Scenario: {st.scenario}</p> : null}
+                        {Array.isArray(st.structures) && st.structures.length ? (
+                          <p className="mt-1.5">Structures: {st.structures.join(' · ')}</p>
+                        ) : null}
+                        {Array.isArray(st.recycles_from) && st.recycles_from.length ? (
+                          <p className="mt-1.5">Reuses stage {st.recycles_from.join(', ')}</p>
+                        ) : null}
+                        {st.done_when ? <p className="mt-1.5 text-gray-300">Done when: {st.done_when}</p> : null}
+                        {Array.isArray(st.phrases) && st.phrases.length ? (
+                          <div className="mt-2 space-y-1 border-t border-gray-700/60 pt-2">
+                            {st.phrases.map((ph, i) => (
+                              <div key={i} className="truncate">
+                                <span className="text-gray-200">{ph.phrase}</span>
+                                {ph.translation ? <span className="text-gray-500"> — {ph.translation}</span> : null}
+                              </div>
+                            ))}
+                          </div>
+                        ) : null}
+                      </div>
+                    ) : null}
+                  </div>
+                );
+              })}
+
+              {current && gate ? (
+                <div className="rounded-xl border border-gray-800 bg-gray-800/40 p-3.5">
+                  <div className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-gray-500">
+                    To clear “{current.title}”
+                  </div>
+                  <div className="space-y-1.5 text-xs">
+                    <div className={gate.aiDone ? 'text-emerald-300' : 'text-gray-400'}>
+                      {gate.aiDone ? '✓' : '○'} A session shows you can do it
+                    </div>
+                    <div className={gate.vocabDone ? 'text-emerald-300' : 'text-gray-400'}>
+                      {gate.vocabDone ? '✓' : '○'} All {gate.total} phrases mastered ({gate.mastered}/{gate.total})
+                    </div>
+                  </div>
+                  {gate.outstanding.length ? (
+                    <div className="mt-2 border-t border-gray-700/60 pt-2 text-[11px] text-gray-500">
+                      Still owed: {gate.outstanding.slice(0, 4).map(o => o.phrase + ' (' + o.uses + '/3)').join(' · ')}
+                      {gate.outstanding.length > 4 ? ' …' : ''}
+                    </div>
+                  ) : null}
+                  {gate.complete ? (
+                    <button onClick={() => onAdvance(current, {})} disabled={busy}
+                      className="no-tap mt-3 w-full rounded-xl bg-emerald-600 px-4 py-2.5 text-sm font-semibold text-white transition hover:bg-emerald-500 disabled:opacity-50">
+                      Clear this stage
+                    </button>
+                  ) : (
+                    <button onClick={() => onAdvance(current, { force: true })} disabled={busy}
+                      className="no-tap mt-3 w-full rounded-lg border border-gray-700 px-4 py-2 text-xs text-gray-400 transition hover:text-white disabled:opacity-40">
+                      Skip this stage anyway
+                    </button>
+                  )}
+                </div>
+              ) : null}
+
+              <button onClick={onArchive} disabled={busy}
+                className="no-tap w-full rounded-lg px-4 py-2 text-xs text-gray-500 transition hover:text-gray-300 disabled:opacity-40">
+                Archive this island and start another
+              </button>
+            </div>
+          )}
+
+          <div className="mt-3 flex min-h-[20px] items-center gap-2 text-xs text-gray-500">
+            {busy ? <Spinner className="h-3.5 w-3.5" /> : null}
+            <span>{note}</span>
+          </div>
+        </div>
+
+        {!island ? (
+          <div className="safe-b mx-auto w-full max-w-md border-t border-gray-800 px-5 py-4">
+            <button onClick={() => onCreate(name, about)} disabled={busy || !name.trim()}
+              className="no-tap flex w-full items-center justify-center gap-2 rounded-xl bg-indigo-600 px-4 py-3.5 text-sm font-semibold text-white transition hover:bg-indigo-500 disabled:opacity-50">
+              {busy ? <Spinner className="h-4 w-4" /> : null}
+              {busy ? 'Designing…' : 'Design my roadmap'}
+            </button>
+          </div>
+        ) : null}
       </div>
     </div>
   );
@@ -2590,10 +3017,15 @@ function Dashboard({
   stats, onStart, onOpenSettings, onShowLastFeedback, hasLastFeedback, onExport,
   mode, onModeChange, onSuggest, language, onLanguageChange, switchingLanguage,
   learner, learnerCount, onOpenProfiles, dailyStats, onOpenStats,
-  srsCounts, srsLoading, unforgedCount, onStudy, onForge, newPerDay, onNewPerDayChange
+  srsCounts, srsLoading, unforgedCount, onStudy, onForge, newPerDay, onNewPerDayChange,
+  island, stage, doneStages, totalStages, onOpenIsland
 }) {
   const [custom, setCustom] = useState('');
-  const chosen = custom.trim() || recommendedTopic;
+  // An active island decides the topic; a freeform entry still overrides it.
+  const stageTopic = stage
+    ? stage.title + (stage.scenario ? ' — ' + stage.scenario : '')
+    : '';
+  const chosen = custom.trim() || stageTopic || recommendedTopic;
 
   return (
     <div className="mx-auto flex min-h-full w-full max-w-md flex-col px-5 pb-28 pt-8">
@@ -2742,16 +3174,44 @@ function Dashboard({
       </section>
 
       <section className="mb-7">
-        <h2 className="mb-2.5 text-sm font-semibold text-gray-200">Topic of the day</h2>
+        <div className="mb-2.5 flex items-baseline justify-between">
+          <h2 className="text-sm font-semibold text-gray-200">Topic of the day</h2>
+          <button onClick={onOpenIsland}
+            className="no-tap text-xs font-medium text-indigo-400 transition hover:text-indigo-300">
+            {island ? 'Island · ' + doneStages + '/' + totalStages : 'Build an island'}
+          </button>
+        </div>
+
         <button onClick={() => setCustom('')}
           className={'no-tap w-full rounded-2xl border p-4 text-left transition ' + (custom.trim()
             ? 'border-gray-700 bg-gray-800/50 opacity-60'
             : 'border-indigo-500/60 bg-indigo-500/10')}>
-          <div className="mb-1 flex items-center gap-2 text-[11px] font-semibold uppercase tracking-wider text-indigo-400">
-            <span className="inline-block h-1.5 w-1.5 rounded-full bg-indigo-400" />
-            Recommended · {recommendedSource}
-          </div>
-          <div className="text-[15px] leading-snug text-white">{recommendedTopic}</div>
+          {stage ? (
+            <React.Fragment>
+              <div className="mb-1 flex items-center gap-2 text-[11px] font-semibold uppercase tracking-wider text-indigo-400">
+                <span className="inline-block h-1.5 w-1.5 rounded-full bg-indigo-400" />
+                Stage {stage.position} of {totalStages} · {island.name}
+              </div>
+              <div className="text-[15px] leading-snug text-white">{stage.title}</div>
+              {stage.objective ? (
+                <div className="mt-1.5 text-xs leading-relaxed text-gray-400">{stage.objective}</div>
+              ) : null}
+              {totalStages ? (
+                <div className="mt-3 h-1.5 w-full overflow-hidden rounded-full bg-gray-700">
+                  <div className="h-full rounded-full bg-indigo-500 transition-all"
+                    style={{ width: (doneStages / totalStages * 100) + '%' }} />
+                </div>
+              ) : null}
+            </React.Fragment>
+          ) : (
+            <React.Fragment>
+              <div className="mb-1 flex items-center gap-2 text-[11px] font-semibold uppercase tracking-wider text-indigo-400">
+                <span className="inline-block h-1.5 w-1.5 rounded-full bg-indigo-400" />
+                Recommended · {recommendedSource}
+              </div>
+              <div className="text-[15px] leading-snug text-white">{recommendedTopic}</div>
+            </React.Fragment>
+          )}
         </button>
 
         <div className="my-3 flex items-center gap-3">
@@ -3105,6 +3565,11 @@ function App() {
   });
   const [profilesOpen, setProfilesOpen] = useState(false);
   const [profilesBusy, setProfilesBusy] = useState(false);
+  const [island, setIsland] = useState(null);
+  const [stages, setStages] = useState([]);
+  const [islandOpen, setIslandOpen] = useState(false);
+  const [islandBusy, setIslandBusy] = useState(false);
+  const [islandNote, setIslandNote] = useState('');
   const [srsSets, setSrsSets] = useState([]);
   const [srsReviews, setSrsReviews] = useState(() => new Map());
   const [srsIntroducedToday, setSrsIntroducedToday] = useState(0);
@@ -3127,6 +3592,7 @@ function App() {
   const [toast, setToast] = useState(null);
 
   const [vocab, setVocab] = useState([]);
+  const [allVocab, setAllVocab] = useState([]);
   const [vocabLoading, setVocabLoading] = useState(true);
   const [stats, setStats] = useState({ sessions: 0, mastered: 0 });
   const [recommended, setRecommended] = useState({ topic: FALLBACK_TOPICS[0], source: 'starter' });
@@ -3163,6 +3629,7 @@ function App() {
   const chunksRef = useRef([]);
   const messagesRef = useRef([]);
   const sessionVocabRef = useRef([]);
+  const sessionStageRef = useRef(null);
   const endingRef = useRef(false);
   const statusRef = useRef('idle');
   const turkishCacheRef = useRef(new Map());
@@ -3243,13 +3710,17 @@ function App() {
     if (!db || !lang || !who) return [];
     setVocabLoading(true);
     try {
+      // Fetch every status: the vocabulary bar wants the 'learning' ones, but the
+      // island gate has to see mastered phrases too, or clearing a stage becomes
+      // impossible the moment its phrases graduate.
       const res = await scoped(db.from('target_vocabulary').select('*'), who, lang)
-        .eq('status', 'learning')
         .order('created_at', { ascending: true });
       if (res.error) throw new Error(missingLanguageColumn(res.error) ? MIGRATION_HINT : res.error.message);
-      const rows = res.data || [];
+      const all = res.data || [];
+      const rows = all.filter(r => r.status === 'learning');
+      setAllVocab(all);
       setVocab(rows);
-      return rows;
+      return all;
     } catch (err) {
       pushToast('error', 'Could not load vocabulary: ' + err.message);
       return [];
@@ -3297,7 +3768,13 @@ function App() {
 
       const rows = vocabRows || vocab;
       if (rows && rows.length) {
-        const picks = rows.slice(0, 3).map(v => '"' + v.phrase + '"').join(', ');
+        const learning = rows.filter(r => r.status === 'learning');
+        if (!learning.length) {
+          const idx = new Date().getDate() % FALLBACK_TOPICS.length;
+          setRecommended({ topic: FALLBACK_TOPICS[idx], source: 'starter' });
+          return;
+        }
+        const picks = learning.slice(0, 3).map(v => '"' + v.phrase + '"').join(', ');
         setRecommended({
           topic: 'A conversation where you naturally need ' + picks + '.',
           source: 'from your active vocabulary'
@@ -3343,6 +3820,215 @@ function App() {
     setStatsOpen(true);
     refreshDailyStats();
   }, [refreshDailyStats]);
+
+  /* ------------------------------------------------------------ language islands */
+
+  const refreshIsland = useCallback(async (c, languageOverride, learnerOverride) => {
+    const db = c || client;
+    const lang = languageOverride || languageRef.current;
+    const who = learnerOverride || learnerRef.current;
+    if (!db || !lang || !who) return null;
+
+    try {
+      const isl = await scoped(db.from('islands').select('*'), who, lang)
+        .eq('status', 'active')
+        .maybeSingle();
+      if (isl.error) throw new Error(isl.error.message);
+
+      if (!isl.data) {
+        setIsland(null);
+        setStages([]);
+        return null;
+      }
+
+      const st = await db
+        .from('island_stages')
+        .select('*')
+        .eq('island_id', isl.data.id)
+        .order('position', { ascending: true });
+      if (st.error) throw new Error(st.error.message);
+
+      setIsland(isl.data);
+      setStages(st.data || []);
+      return { island: isl.data, stages: st.data || [] };
+    } catch (err) {
+      console.error(err);
+      if (missingIslandTables(err)) {
+        pushToast('error', 'The island tables are missing. Run the latest migration, then reload.');
+      } else {
+        pushToast('error', 'Could not load your island: ' + err.message);
+      }
+      return null;
+    }
+  }, [client, pushToast]);
+
+  const currentStage = useMemo(
+    () => stages.find(s => s.status === 'current') || null,
+    [stages]
+  );
+
+  // Phrases enter the vocabulary when their stage becomes current, so the SRS
+  // queue only ever holds what the learner is actually working on.
+  const seedStagePhrases = useCallback(async (stage) => {
+    if (!client || !stage || stage.seeded) return;
+    const phrases = Array.isArray(stage.phrases) ? stage.phrases : [];
+    if (!phrases.length) return;
+
+    try {
+      const existing = await scoped(
+        client.from('target_vocabulary').select('phrase'), learnerRef.current, languageRef.current
+      );
+      if (existing.error) throw new Error(existing.error.message);
+      const known = new Set((existing.data || []).map(r => normalizeText(r.phrase)));
+
+      const rows = phrases
+        .filter(p => !known.has(normalizeText(p.phrase)))
+        .map(p => ({
+          user_id: learnerRef.current,
+          target_language: languageRef.current,
+          phrase: p.phrase,
+          translation: p.translation || null,
+          correction_context: p.note || null,
+          times_reviewed: 0,
+          status: 'learning'
+        }));
+
+      if (rows.length) {
+        const ins = await client.from('target_vocabulary').insert(rows);
+        if (ins.error) throw new Error(ins.error.message);
+      }
+      const upd = await client.from('island_stages').update({ seeded: true }).eq('id', stage.id);
+      if (upd.error) throw new Error(upd.error.message);
+    } catch (err) {
+      console.error(err);
+      pushToast('error', 'Could not add the stage phrases: ' + err.message);
+    }
+  }, [client, pushToast]);
+
+  const createIsland = useCallback(async (name, aboutYou) => {
+    if (!client || !profile || !name.trim()) return;
+
+    setIslandBusy(true);
+    setIslandNote('Designing your roadmap — this takes a moment…');
+    try {
+      // Feed the planner what the learner actually gets wrong, when we know it.
+      const recent = await scoped(
+        client.from('conversations').select('feedback, created_at'), learnerRef.current, languageRef.current
+      ).order('created_at', { ascending: false }).limit(5);
+      const weakSpots = [];
+      ((recent.data) || []).forEach(row => {
+        const fb = row.feedback;
+        if (fb && Array.isArray(fb.grammar_mistakes)) {
+          fb.grammar_mistakes.slice(0, 3).forEach(m => {
+            if (m && m.explanation) weakSpots.push(m.explanation);
+          });
+        }
+      });
+
+      const plan = await generateIslandRoadmap(
+        config.openaiKey, profile, name.trim(), aboutYou, weakSpots.slice(0, 8)
+      );
+
+      const insIsland = await client.from('islands').insert({
+        user_id: learnerRef.current,
+        target_language: languageRef.current,
+        name: name.trim(),
+        goal: plan.goal,
+        about_you: (aboutYou || '').trim() || null,
+        status: 'active'
+      }).select().single();
+      if (insIsland.error) throw new Error(insIsland.error.message);
+
+      const rows = plan.stages.map(st => ({
+        island_id: insIsland.data.id,
+        user_id: learnerRef.current,
+        target_language: languageRef.current,
+        position: st.position,
+        title: st.title,
+        objective: st.objective,
+        scenario: st.scenario,
+        structures: st.structures,
+        phrases: st.phrases,
+        done_when: st.done_when,
+        recycles_from: st.recycles_from,
+        status: st.position === 1 ? 'current' : 'locked'
+      }));
+
+      const insStages = await client.from('island_stages').insert(rows).select();
+      if (insStages.error) throw new Error(insStages.error.message);
+
+      const first = (insStages.data || []).find(r => r.position === 1);
+      if (first) await seedStagePhrases(first);
+
+      setIslandNote('');
+      pushToast('success', 'Island ready: ' + plan.stages.length + ' stages mapped out.');
+      await refreshIsland(client);
+      await refreshVocab(client);
+      setIslandOpen(false);
+    } catch (err) {
+      console.error(err);
+      setIslandNote('');
+      pushToast('error', 'Could not design the island: ' + (err.message || String(err)));
+    } finally {
+      setIslandBusy(false);
+    }
+  }, [client, profile, config, seedStagePhrases, refreshIsland, refreshVocab, pushToast]);
+
+  const advanceStageRef = useRef(async () => {});
+
+  const advanceStage = useCallback(async (stage, opts) => {
+    if (!client || !stage) return;
+    const forced = opts && opts.force;
+
+    setIslandBusy(true);
+    try {
+      const done = await client.from('island_stages').update({
+        status: 'done',
+        completed_at: new Date().toISOString()
+      }).eq('id', stage.id);
+      if (done.error) throw new Error(done.error.message);
+
+      const next = stages.find(s => s.position === stage.position + 1);
+      if (next) {
+        const upd = await client.from('island_stages').update({ status: 'current' }).eq('id', next.id);
+        if (upd.error) throw new Error(upd.error.message);
+        await seedStagePhrases(next);
+        pushToast('success', (forced ? 'Skipped to' : 'Stage cleared. Next up: ') + ' ' + next.title + '.');
+      } else {
+        const fin = await client.from('islands').update({ status: 'done' }).eq('id', stage.island_id);
+        if (fin.error) throw new Error(fin.error.message);
+        pushToast('success', 'Island complete. That subject is yours now.');
+      }
+
+      await refreshIsland(client);
+      await refreshVocab(client);
+    } catch (err) {
+      console.error(err);
+      pushToast('error', 'Could not advance the stage: ' + err.message);
+    } finally {
+      setIslandBusy(false);
+    }
+  }, [client, stages, seedStagePhrases, refreshIsland, refreshVocab, pushToast]);
+
+  useEffect(() => { advanceStageRef.current = advanceStage; }, [advanceStage]);
+
+  const archiveIsland = useCallback(async () => {
+    if (!client || !island) return;
+    setIslandBusy(true);
+    try {
+      const upd = await client.from('islands').update({ status: 'archived' }).eq('id', island.id);
+      if (upd.error) throw new Error(upd.error.message);
+      setIsland(null);
+      setStages([]);
+      pushToast('success', 'Island archived. Your phrases and history stay put.');
+      await refreshIsland(client);
+    } catch (err) {
+      console.error(err);
+      pushToast('error', 'Could not archive: ' + err.message);
+    } finally {
+      setIslandBusy(false);
+    }
+  }, [client, island, refreshIsland, pushToast]);
 
   /* -------------------------------------------------------- spaced repetition */
 
@@ -3575,7 +4261,8 @@ function App() {
           refreshStats(db, activeLanguage, activeLearner),
           refreshRecommendedTopic(db, rows, activeLanguage, activeLearner),
           refreshDailyStats(db, activeLanguage, activeLearner),
-          refreshSrs(db, activeLanguage, activeLearner)
+          refreshSrs(db, activeLanguage, activeLearner),
+          refreshIsland(db, activeLanguage, activeLearner)
         ]);
       } catch (err) {
         if (cancelled) return;
@@ -3709,7 +4396,7 @@ function App() {
   }, [upsertRealtimeItem, pushToast]);
 
   const startRealtimeSession = useCallback(async (chosenTopic) => {
-    const sessionConfig = buildRealtimeSession(profile, chosenTopic, sessionVocabRef.current, config.voice);
+    const sessionConfig = buildRealtimeSession(profile, chosenTopic, sessionVocabRef.current, config.voice, sessionStageRef.current);
 
     try {
       const conn = await connectRealtime(config.openaiKey, sessionConfig, {
@@ -3778,6 +4465,7 @@ function App() {
     setSheetOpen(false);
     setMicDisabled(false);
     sessionVocabRef.current = vocab.slice();
+    sessionStageRef.current = currentStage;
     realtimeItemsRef.current = [];
     setConnectionState('');
     setMuted(false);
@@ -3791,7 +4479,7 @@ function App() {
 
     setStatus('starting');
 
-    const systemPrompt = buildSystemPrompt(profile, chosenTopic, sessionVocabRef.current);
+    const systemPrompt = buildSystemPrompt(profile, chosenTopic, sessionVocabRef.current, sessionStageRef.current);
 
     try {
       const opener = await chatCompletion(config.openaiKey, [
@@ -3816,7 +4504,7 @@ function App() {
       pushToast('error', err.message);
       setStatus('idle');
     }
-  }, [profile, vocab, config, mode, startRealtimeSession, playAudioBlob, pushToast]);
+  }, [profile, vocab, config, mode, currentStage, startRealtimeSession, playAudioBlob, pushToast]);
 
   /* --------------------------------------------------------- the voice turn */
 
@@ -3841,7 +4529,7 @@ function App() {
       messagesRef.current = withUser;
 
       setStatus('thinking');
-      const systemPrompt = buildSystemPrompt(profile, topic, sessionVocabRef.current);
+      const systemPrompt = buildSystemPrompt(profile, topic, sessionVocabRef.current, sessionStageRef.current);
       const reply = await chatCompletion(
         config.openaiKey,
         [{ role: 'system', content: systemPrompt }].concat(withUser),
@@ -3967,6 +4655,7 @@ function App() {
     // Pin the language at end time so a mid-analysis switch cannot misfile rows.
     const sessionLanguage = languageRef.current;
     const sessionLearner = learnerRef.current;
+    const sessionStage = sessionStageRef.current;
     const sessionVocab = sessionVocabRef.current.slice();
 
     const userTurns = transcript.filter(m => m.role === 'user');
@@ -3982,7 +4671,7 @@ function App() {
     try {
       const raw = await chatCompletion(config.openaiKey, [
         { role: 'system', content: 'You are a meticulous language assessor. You always reply with a single valid JSON object and nothing else.' },
-        { role: 'user', content: buildAnalysisPrompt(profile, sessionTopic, transcript, sessionVocab) }
+        { role: 'user', content: buildAnalysisPrompt(profile, sessionTopic, transcript, sessionVocab, sessionStage) }
       ], { json: true, temperature: 0.3, maxTokens: 1600 });
 
       const cleaned = raw.replace(/^```(?:json)?/i, '').replace(/```$/, '').trim();
@@ -4000,7 +4689,9 @@ function App() {
       grammar_mistakes: Array.isArray(parsed.grammar_mistakes) ? parsed.grammar_mistakes : [],
       recommended_phrases: Array.isArray(parsed.recommended_phrases) ? parsed.recommended_phrases : [],
       next_topic_recommendation: parsed.next_topic_recommendation || '',
-      cefr_level_feedback: parsed.cefr_level_feedback || ''
+      cefr_level_feedback: parsed.cefr_level_feedback || '',
+      stage_goal_met: !!parsed.stage_goal_met,
+      stage_evidence: parsed.stage_evidence || ''
     };
 
     // Vocab progression engine — a phrase counts as reviewed when the local scan of the
@@ -4087,6 +4778,7 @@ function App() {
         const ins = await client.from('conversations').insert({
           user_id: sessionLearner,
           target_language: sessionLanguage,
+          stage_id: sessionStage ? sessionStage.id : null,
           topic: sessionTopic,
           duration_seconds: usedSeconds,
           transcript: transcript,
@@ -4111,14 +4803,43 @@ function App() {
       setSaveNote('Saved' + (bits.length ? ' · ' + bits.join(' · ') : '') + '.');
     }
 
+    // The island gate needs both halves: the analyser's verdict on the objective,
+    // and every stage phrase actually used enough to count as owned.
+    if (sessionStage) {
+      try {
+        const patch = { sessions_count: (sessionStage.sessions_count || 0) + 1 };
+        if (analysis.stage_goal_met) patch.ai_verdict = true;
+        const upd = await client.from('island_stages').update(patch).eq('id', sessionStage.id);
+        if (upd.error) throw new Error(upd.error.message);
+      } catch (err) {
+        console.error(err);
+        problems.push('island progress');
+      }
+    }
+
     const rows = await refreshVocab(client, sessionLanguage, sessionLearner);
+
+    // Both halves of the gate are objective, so when they are met there is
+    // nothing left to decide: move the island on and tell the learner.
+    if (sessionStage) {
+      try {
+        const fresh = await client.from('island_stages').select('*').eq('id', sessionStage.id).maybeSingle();
+        if (!fresh.error && fresh.data && fresh.data.status === 'current') {
+          const gate = stageGate(fresh.data, rows);
+          if (gate.complete) await advanceStageRef.current(fresh.data, {});
+        }
+      } catch (err) {
+        console.error('Stage advance check failed', err);
+      }
+    }
+
     await Promise.all([
       refreshStats(client, sessionLanguage, sessionLearner),
       refreshRecommendedTopic(client, rows, sessionLanguage, sessionLearner),
       refreshDailyStats(client, sessionLanguage, sessionLearner)
     ]);
     endingRef.current = false;
-  }, [client, config, profile, topic, secondsLeft, releaseMic, stopPlayback, teardownRealtime, pushToast, refreshVocab, refreshStats, refreshRecommendedTopic, refreshDailyStats]);
+  }, [client, config, profile, topic, secondsLeft, releaseMic, stopPlayback, teardownRealtime, pushToast, refreshVocab, refreshStats, refreshRecommendedTopic, refreshDailyStats, refreshIsland]);
 
   /* ------------------------------------------------------- learner profiles */
 
@@ -4141,6 +4862,7 @@ function App() {
       setLearnerId(nextId);
       setProfile(row);
       setVocab([]);
+      setAllVocab([]);
       setFeedback(null);
       setSheetOpen(false);
       setSuggestItems([]);
@@ -4148,6 +4870,8 @@ function App() {
       setSrsReviews(new Map());
       setSrsRevlog([]);
       setSrsIntroducedToday(0);
+      setIsland(null);
+      setStages([]);
       turkishCacheRef.current = new Map();
 
       const cfg = loadConfig();
@@ -4159,7 +4883,8 @@ function App() {
         refreshStats(client, lang, nextId),
         refreshRecommendedTopic(client, rows, lang, nextId),
         refreshDailyStats(client, lang, nextId),
-        refreshSrs(client, lang, nextId)
+        refreshSrs(client, lang, nextId),
+        refreshIsland(client, lang, nextId)
       ]);
       setProfilesOpen(false);
       const who = learners.find(l => l.id === nextId);
@@ -4252,6 +4977,7 @@ function App() {
       setLanguage(nextLanguage);
       setProfile(row);
       setVocab([]);
+      setAllVocab([]);
       setFeedback(null);
       setSheetOpen(false);
       setSuggestItems([]);
@@ -4259,6 +4985,8 @@ function App() {
       setSrsReviews(new Map());
       setSrsRevlog([]);
       setSrsIntroducedToday(0);
+      setIsland(null);
+      setStages([]);
       turkishCacheRef.current = new Map();
 
       const cfg = loadConfig();
@@ -4270,7 +4998,8 @@ function App() {
         refreshStats(client, nextLanguage),
         refreshRecommendedTopic(client, rows, nextLanguage),
         refreshDailyStats(client, nextLanguage),
-        refreshSrs(client, nextLanguage)
+        refreshSrs(client, nextLanguage),
+        refreshIsland(client, nextLanguage)
       ]);
       pushToast('success', 'Switched to ' + nextLanguage + ' · ' + row.current_cefr + '.');
     } catch (err) {
@@ -4618,8 +5347,29 @@ function App() {
           onForge={() => setForgeOpen(true)}
           newPerDay={newPerDay}
           onNewPerDayChange={changeNewPerDay}
+          island={island}
+          stage={currentStage}
+          doneStages={stages.filter(x => x.status === 'done').length}
+          totalStages={stages.length}
+          onOpenIsland={() => setIslandOpen(true)}
         />
       )}
+
+      {islandOpen && profile ? (
+        <IslandSheet
+          island={island}
+          stages={stages}
+          vocab={allVocab}
+          busy={islandBusy}
+          note={islandNote}
+          targetLanguage={profile.target_language}
+          cefr={profile.current_cefr}
+          onCreate={createIsland}
+          onAdvance={advanceStage}
+          onArchive={archiveIsland}
+          onClose={() => setIslandOpen(false)}
+        />
+      ) : null}
 
       {studyOpen && profile ? (
         <StudyOverlay

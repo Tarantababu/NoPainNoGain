@@ -17,6 +17,7 @@ No build step, no bundler, no server. Open `index.html` and it runs: React 18, B
 - **Up to five learner profiles**, each with completely independent progress.
 - **Daily stats and streaks** so you can see the habit forming.
 - **Spaced repetition over your saved phrases** — Wordstack's flashcard engine, built in.
+- **Language islands** — you pick a subject to own; the AI designs the roadmap that gets you there.
 - **Exports your vocabulary** as CSV or plain text, with Turkish translations.
 
 ---
@@ -170,6 +171,42 @@ Up to **five learner profiles** share one install — useful for a couple, a fam
 Each profile owns its languages, levels, vocabulary, session history and streak. Nothing is shared between them.
 
 The five-profile cap is enforced by a database trigger, not just the UI, so a stray tab or a direct API call cannot exceed it either. Deleting a profile erases that person's vocabulary, sessions and levels in every language — the UI asks twice, and it cannot be undone.
+
+---
+
+## Language islands
+
+A language island, in Boris Shekhtman's sense, is a block of speech you own cold — your job, your city, the argument that keeps coming up. You rehearse it until it is automatic, then deploy it in real conversation.
+
+**You choose the island. The AI designs everything below it.**
+
+Tell it what you want to own ("my work as a backend developer") and two or three sentences about yourself. It returns a roadmap of **ten stages**, each a session's worth of work:
+
+| Field | What it holds |
+| --- | --- |
+| `objective` | The concrete thing you must be able to say |
+| `scenario` | The situation you practise it in |
+| `structures` | Grammar to lean on |
+| `phrases` | 4–6 chunks, which become vocabulary when you reach the stage |
+| `done_when` | An observable test, judged from your transcript |
+| `recycles_from` | Earlier stages this one deliberately reuses |
+
+That last field is what makes it a roadmap rather than a themed shuffle: every stage after the first is built to re-fire the phrases from the ones before it. Early stages are the load-bearing ones you need in every conversation; later ones handle disagreeing, telling a story with a point, and questions you did not see coming.
+
+The planner is also fed your **recorded mistakes** from recent sessions, so the roadmap targets what you actually get wrong rather than what was guessed on day one.
+
+### How a stage moves
+
+"Topic of the day" becomes the current stage, and its objective and scenario are written into the session prompt — the partner steers so you have to produce the stage's phrases yourself, without ever mentioning the stage exists.
+
+A stage clears when **both** halves are satisfied:
+
+1. **The analyser rules the objective met**, judged strictly on what you produced, quoting your own words as evidence.
+2. **Every phrase in the stage is mastered** — three real uses in conversation.
+
+When both land, the island advances on its own and the next stage's phrases enter your vocabulary. The island sheet always shows exactly which phrases are still owed and at what count, so a locked stage is never a mystery. If the partner never steers to a phrase and you get stuck, **Skip this stage** is there as an escape hatch.
+
+One island runs per language at a time. Archiving keeps its phrases and history.
 
 ---
 
