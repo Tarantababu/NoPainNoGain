@@ -1702,7 +1702,8 @@ const inputClass =
 
 /* -------------------------------------------------------------- setup screen */
 
-function SetupScreen({ initial, onSaved, onCancel, pushToast, learnerId }) {
+function SetupScreen({ initial, onSaved, onCancel, pushToast, learnerId, resetInfo }) {
+  const [confirmingReset, setConfirmingReset] = useState(false);
   const [openaiKey, setOpenaiKey] = useState(initial ? initial.openaiKey : '');
   const [supabaseUrl, setSupabaseUrl] = useState(initial ? initial.supabaseUrl : '');
   const [supabaseKey, setSupabaseKey] = useState(initial ? initial.supabaseKey : '');
@@ -1892,6 +1893,56 @@ function SetupScreen({ initial, onSaved, onCancel, pushToast, learnerId }) {
           </button>
         ) : null}
       </form>
+
+      {resetInfo ? (
+        <div className="mt-8 rounded-2xl border border-red-500/30 bg-red-500/5 p-4">
+          <h2 className="text-sm font-semibold text-red-300">Reset this workspace</h2>
+          <p className="mt-1 text-xs leading-relaxed text-gray-400">
+            Erases everything <span className="text-gray-200">{resetInfo.learnerName}</span> has built in{' '}
+            <span className="text-gray-200">{resetInfo.language}</span>. Your other profiles and other languages are
+            untouched, and your level and injection mode stay as they are.
+          </p>
+
+          <div className="mt-3 grid grid-cols-2 gap-2 text-xs">
+            {[
+              { label: 'phrases', value: resetInfo.phrases },
+              { label: 'sessions', value: resetInfo.sessions },
+              { label: 'forged card sets', value: resetInfo.cardSets },
+              { label: 'island stages', value: resetInfo.stages }
+            ].map(cell => (
+              <div key={cell.label} className="rounded-lg border border-gray-800 bg-gray-900/60 px-2.5 py-2">
+                <span className="font-semibold tabular-nums text-white">{cell.value}</span>
+                <span className="ml-1 text-gray-500">{cell.label}</span>
+              </div>
+            ))}
+          </div>
+
+          {confirmingReset ? (
+            <div className="mt-3">
+              <p className="text-xs font-medium leading-relaxed text-red-300">
+                This cannot be undone. Your vocabulary, flashcards, review history, sessions and island roadmap for{' '}
+                {resetInfo.language} will be gone for good.
+              </p>
+              <div className="mt-2.5 flex gap-2">
+                <button type="button" onClick={resetInfo.onReset} disabled={resetInfo.busy}
+                  className="no-tap flex flex-1 items-center justify-center gap-2 rounded-xl bg-red-600 px-4 py-2.5 text-sm font-semibold text-white transition hover:bg-red-500 disabled:opacity-50">
+                  {resetInfo.busy ? <Spinner className="h-4 w-4" /> : null}
+                  {resetInfo.busy ? 'Erasing…' : 'Erase it all'}
+                </button>
+                <button type="button" onClick={() => setConfirmingReset(false)} disabled={resetInfo.busy}
+                  className="no-tap rounded-xl border border-gray-700 px-4 py-2.5 text-sm text-gray-300 transition hover:text-white">
+                  Cancel
+                </button>
+              </div>
+            </div>
+          ) : (
+            <button type="button" onClick={() => setConfirmingReset(true)} disabled={resetInfo.busy || !resetInfo.total}
+              className="no-tap mt-3 w-full rounded-xl border border-red-500/40 px-4 py-2.5 text-sm font-medium text-red-300 transition hover:bg-red-500/10 disabled:opacity-40">
+              {resetInfo.total ? 'Reset ' + resetInfo.language + ' for ' + resetInfo.learnerName : 'Nothing to reset'}
+            </button>
+          )}
+        </div>
+      ) : null}
 
       <details className="mt-8 rounded-2xl border border-gray-800 bg-gray-800/30 p-4">
         <summary className="cursor-pointer text-sm font-medium text-gray-300">First time? Run this SQL in Supabase</summary>
@@ -3584,6 +3635,7 @@ function App() {
     const n = cfg && cfg.newPerDay;
     return Number.isFinite(n) ? n : DEFAULT_NEW_PER_DAY;
   });
+  const [resetBusy, setResetBusy] = useState(false);
   const [statsOpen, setStatsOpen] = useState(false);
   const [statsLoading, setStatsLoading] = useState(false);
   const [dailyStats, setDailyStats] = useState(null);
@@ -5230,6 +5282,75 @@ function App() {
     }
   }, [vocab, config, profile, client, pushToast]);
 
+  /* --------------------------------------------------------- workspace reset */
+
+  // Wipes the learning data for exactly one (profile, language) pair. Settings
+  // — the level and the injection mode on the profile row — are deliberately
+  // kept, so a reset starts you over rather than reconfiguring you.
+  const resetWorkspace = useCallback(async () => {
+    if (!client) return;
+    const who = learnerRef.current;
+    const lang = languageRef.current;
+
+    setResetBusy(true);
+    const problems = [];
+    try {
+      // Children before parents, so nothing is orphaned if a step fails midway.
+      const steps = [
+        ['island_stages', q => scoped(q, who, lang)],
+        ['islands', q => scoped(q, who, lang)],
+        ['srs_revlog', q => scoped(q, who, lang)],
+        ['srs_reviews', q => scoped(q, who, lang)],
+        ['vocab_sets', q => scoped(q, who, lang)],
+        ['conversations', q => scoped(q, who, lang)],
+        ['target_vocabulary', q => scoped(q, who, lang)]
+      ];
+
+      for (const step of steps) {
+        const res = await step[1](client.from(step[0]).delete());
+        if (res.error) {
+          console.error(step[0], res.error);
+          problems.push(step[0]);
+        }
+      }
+
+      setVocab([]);
+      setAllVocab([]);
+      setSrsSets([]);
+      setSrsReviews(new Map());
+      setSrsRevlog([]);
+      setSrsIntroducedToday(0);
+      setIsland(null);
+      setStages([]);
+      setFeedback(null);
+      setSheetOpen(false);
+      setDailyStats(null);
+      turkishCacheRef.current = new Map();
+
+      if (problems.length) {
+        pushToast('error', 'Reset incomplete — could not clear: ' + problems.join(', ') + '.');
+      } else {
+        pushToast('success', lang + ' reset for ' + (activeLearner ? activeLearner.name : 'this profile') + '.');
+      }
+
+      const rows = await refreshVocab(client, lang, who);
+      await Promise.all([
+        refreshStats(client, lang, who),
+        refreshRecommendedTopic(client, rows, lang, who),
+        refreshDailyStats(client, lang, who),
+        refreshSrs(client, lang, who),
+        refreshIsland(client, lang, who)
+      ]);
+      setScreen('dashboard');
+    } catch (err) {
+      console.error(err);
+      pushToast('error', 'Reset failed: ' + (err.message || String(err)));
+    } finally {
+      setResetBusy(false);
+    }
+  }, [client, activeLearner, pushToast, refreshVocab, refreshStats,
+      refreshRecommendedTopic, refreshDailyStats, refreshSrs, refreshIsland]);
+
   /* ------------------------------------------------------------- settings */
 
   const handleSetupSaved = useCallback(async (cfg, db, savedProfile) => {
@@ -5281,6 +5402,17 @@ function App() {
         <SetupScreen
           initial={initial}
           learnerId={learnerId}
+          resetInfo={screen === 'settings' && profile ? {
+            learnerName: activeLearner ? activeLearner.name : 'this profile',
+            language: profile.target_language,
+            phrases: allVocab.length,
+            sessions: stats.sessions,
+            cardSets: srsSets.length,
+            stages: stages.length,
+            total: allVocab.length + stats.sessions + srsSets.length + stages.length,
+            busy: resetBusy,
+            onReset: resetWorkspace
+          } : null}
           onSaved={handleSetupSaved}
           onCancel={screen === 'settings' && profile ? () => setScreen('dashboard') : null}
           pushToast={pushToast}

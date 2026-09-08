@@ -160,6 +160,8 @@ On first run the app asks for:
 | Vocab injection mode | Adapt Naturally or Force Verbatim |
 | Partner voice | Voice used for the spoken replies |
 
+Settings (the gear icon) reopens this screen later, and carries a **Reset this workspace** action at the bottom. It erases the vocabulary, flashcards, review history, sessions and island roadmap for the profile and language you currently have selected — and nothing else. Your other profiles, your other languages, and your level and injection mode all survive it. It asks twice, and shows you what is about to go.
+
 **Test & Save** verifies the OpenAI key, probes the Supabase tables and writes your profile before letting you through. Everything is stored under the `fluentloop.config.v1` key in `localStorage` — nothing is sent anywhere else.
 
 ---
