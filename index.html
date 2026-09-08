@@ -5,6 +5,8 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
 <meta name="theme-color" content="#111827" />
 <title>Fluent Loop — Voice Language Coach</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><rect width='24' height='24' rx='6.5' fill='%234f46e5'/><g fill='none' stroke='%23ffffff' stroke-width='2.2' stroke-linecap='round' transform='translate(12,12) scale(.72) translate(-12,-12)'><circle cx='12' cy='12' r='7'/><path d='M9 9.6v4.8M12 7.4v9.2M15 9.6v4.8'/></g></svg>" />
+<link rel="apple-touch-icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><rect width='24' height='24' rx='6.5' fill='%234f46e5'/><g fill='none' stroke='%23ffffff' stroke-width='2.2' stroke-linecap='round' transform='translate(12,12) scale(.72) translate(-12,-12)'><circle cx='12' cy='12' r='7'/><path d='M9 9.6v4.8M12 7.4v9.2M15 9.6v4.8'/></g></svg>" />
 
 <script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin></script>
 <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
@@ -1631,6 +1633,16 @@ function Spinner({ className }) {
   );
 }
 
+function LogoMark({ className }) {
+  return (
+    <svg className={className || 'h-6 w-6'} viewBox="0 0 24 24" fill="none" stroke="currentColor"
+      strokeWidth="2.2" strokeLinecap="round" role="img" aria-label="Fluent Loop">
+      <circle cx="12" cy="12" r="7" />
+      <path d="M9 9.6v4.8M12 7.4v9.2M15 9.6v4.8" />
+    </svg>
+  );
+}
+
 function MicIcon({ className }) {
   return (
     <svg className={className || 'h-10 w-10'} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8"
@@ -1814,7 +1826,7 @@ function SetupScreen({ initial, onSaved, onCancel, pushToast, learnerId, resetIn
     <div className="mx-auto flex min-h-full w-full max-w-md flex-col px-5 pb-10 pt-10">
       <div className="mb-8">
         <div className="mb-3 inline-flex h-12 w-12 items-center justify-center rounded-2xl bg-indigo-500/15 text-indigo-400">
-          <MicIcon className="h-6 w-6" />
+          <LogoMark className="h-6 w-6" />
         </div>
         <h1 className="text-2xl font-semibold tracking-tight">Fluent Loop</h1>
         <p className="mt-1 text-sm text-gray-400">
@@ -2261,7 +2273,7 @@ function StudyOverlay({
         <div className="mx-auto w-full max-w-md">
           {finished ? (
             <div className="py-16 text-center">
-              <div className="mb-3 text-4xl">🎉</div>
+              <div className="mb-3 flex justify-center text-indigo-400"><LogoMark className="h-10 w-10" /></div>
               <h2 className="text-lg font-semibold">Queue cleared</h2>
               <p className="mt-1 text-sm text-gray-400">
                 {done} card{done === 1 ? '' : 's'} reviewed. Learning cards come back in a few minutes.

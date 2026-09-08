@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo-tile.svg" width="76" alt="Fluent Loop" />
+</p>
+
 # Fluent Loop
 
 A voice-first language coach in **one HTML file**. You talk out loud for thirty minutes, and the mistakes you make become tomorrow's vocabulary.
@@ -349,6 +353,9 @@ Adapt Naturally sounds like a real conversation. Force Verbatim is better when y
 - **Babel is pinned to `7.26.4`.** Unpinned `@babel/standalone` now resolves to v8, which defaults JSX to the automatic runtime and emits an `import` statement — that breaks an in-browser transform with `Cannot use import statement outside a module`.
 - **Models:** `whisper-1`, `gpt-4o`, `tts-1`, `gpt-realtime`.
 - **Mobile-first dark UI**, built with the Tailwind CDN build.
+- **Logo** lives in `assets/`: `logo.svg` (the mark, inheriting `currentColor`), `logo-tile.svg` (the app icon on
+  indigo), and `logo-wordmark.svg` (horizontal lockup). The favicon is the same mark inlined as a data URI, so the
+  app stays a single file.
 
 ---
 

@@ -1,0 +1,9 @@
+<!-- Fluent Loop mark: the ring is the loop you keep coming back to,
+     the three bars are your voice inside it. Uses currentColor so it
+     inherits whatever it is placed on. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24"
+     fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"
+     role="img" aria-label="Fluent Loop">
+  <circle cx="12" cy="12" r="7"/>
+  <path d="M9 9.6v4.8M12 7.4v9.2M15 9.6v4.8"/>
+</svg>
