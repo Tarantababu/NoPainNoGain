@@ -134,12 +134,14 @@ const { useState, useEffect, useRef, useCallback, useMemo } = React;
 /* ---------------------------------------------------------------- constants */
 
 const DEFAULT_USER = 'default_user';
+const MAX_PROFILES = 5;
+const PROFILE_EMOJI = ['🙂', '🦊', '🐙', '🦉', '🐳', '🌵', '🍀', '⚡', '🎧', '🚀'];
 
 // Every learner-owned row is scoped to (user_id, target_language) so that
 // switching language switches to a completely separate vocabulary, history and
 // level. Nothing crosses between languages.
-function scoped(query, language) {
-  return query.eq('user_id', DEFAULT_USER).eq('target_language', language);
+function scoped(query, learnerId, language) {
+  return query.eq('user_id', learnerId).eq('target_language', language);
 }
 
 function missingLanguageColumn(error) {
@@ -148,8 +150,8 @@ function missingLanguageColumn(error) {
     (msg.indexOf('does not exist') !== -1 || msg.indexOf('column') !== -1 || msg.indexOf('schema cache') !== -1);
 }
 
-const MIGRATION_HINT = 'Your database is still on the single-language schema. ' +
-  'Run the per-language migration shown on the setup screen, then reload.';
+const MIGRATION_HINT = 'Your database is missing the latest schema. ' +
+  'Run the migrations shown on the setup screen (or `supabase db push`), then reload.';
 const SESSION_SECONDS = 30 * 60;
 const MASTERY_THRESHOLD = 3;
 const CONFIG_KEY = 'fluentloop.config.v1';
@@ -287,11 +289,11 @@ function extensionForMime(mime) {
 
 // One profile row per language: your German level and your Spanish level are
 // independent of each other.
-async function loadOrCreateProfile(db, language, defaults) {
+async function loadOrCreateProfile(db, learnerId, language, defaults) {
   const existing = await db
     .from('profiles')
     .select('*')
-    .eq('user_id', DEFAULT_USER)
+    .eq('user_id', learnerId)
     .eq('target_language', language)
     .maybeSingle();
   if (existing.error) throw new Error('Supabase: ' + existing.error.message);
@@ -300,7 +302,7 @@ async function loadOrCreateProfile(db, language, defaults) {
   const ins = await db
     .from('profiles')
     .insert({
-      user_id: DEFAULT_USER,
+      user_id: learnerId,
       target_language: language,
       current_cefr: (defaults && defaults.current_cefr) || 'B1',
       vocab_injection_mode: (defaults && defaults.vocab_injection_mode) || 'adapt_naturally'
@@ -309,6 +311,42 @@ async function loadOrCreateProfile(db, language, defaults) {
     .single();
   if (ins.error) throw new Error('Supabase: ' + ins.error.message);
   return ins.data;
+}
+
+
+// Learner profiles are separate people using the same install: each one owns
+// its own languages, vocabulary, history and stats. The database caps these at
+// five with a trigger, so the UI limit is a courtesy, not the enforcement.
+async function fetchLearners(db) {
+  const res = await db.from('learners').select('*').order('created_at', { ascending: true });
+  if (res.error) throw new Error('Supabase: ' + res.error.message);
+  return res.data || [];
+}
+
+async function ensureLearner(db) {
+  const rows = await fetchLearners(db);
+  if (rows.length) return rows;
+
+  const ins = await db
+    .from('learners')
+    .insert({ id: DEFAULT_USER, name: 'Me', emoji: PROFILE_EMOJI[0] })
+    .select()
+    .single();
+  if (ins.error) throw new Error('Supabase: ' + ins.error.message);
+  return [ins.data];
+}
+
+function newLearnerId() {
+  const rand = (window.crypto && window.crypto.randomUUID)
+    ? window.crypto.randomUUID()
+    : String(Date.now()) + Math.random().toString(16).slice(2);
+  return 'learner_' + rand;
+}
+
+function missingLearnersTable(error) {
+  const msg = (error && error.message ? error.message : String(error || '')).toLowerCase();
+  return msg.indexOf('learners') !== -1 &&
+    (msg.indexOf('does not exist') !== -1 || msg.indexOf('schema cache') !== -1);
 }
 
 /* -------------------------------------------------------------- OpenAI calls */
@@ -535,6 +573,126 @@ async function connectRealtime(apiKey, sessionConfig, handlers) {
     teardown();
     throw err;
   }
+}
+
+/* -------------------------------------------------------------- daily stats */
+
+// Local calendar days, not UTC: a session at 23:30 belongs to that evening.
+function dayKey(value) {
+  const d = value instanceof Date ? value : new Date(value);
+  if (isNaN(d.getTime())) return '';
+  return d.getFullYear() + '-' +
+    String(d.getMonth() + 1).padStart(2, '0') + '-' +
+    String(d.getDate()).padStart(2, '0');
+}
+
+function addDays(date, delta) {
+  const d = new Date(date.getTime());
+  d.setDate(d.getDate() + delta);
+  return d;
+}
+
+function computeStreak(daysWithActivity, today) {
+  // Today not being practised yet does not break a streak that ran to yesterday.
+  let cursor = daysWithActivity.has(dayKey(today)) ? new Date(today) : addDays(today, -1);
+  let current = 0;
+  while (daysWithActivity.has(dayKey(cursor))) {
+    current += 1;
+    cursor = addDays(cursor, -1);
+  }
+
+  let best = 0;
+  let run = 0;
+  const sorted = Array.from(daysWithActivity).sort();
+  let previous = null;
+  sorted.forEach(key => {
+    if (previous) {
+      const gap = Math.round((new Date(key + 'T00:00:00') - new Date(previous + 'T00:00:00')) / 86400000);
+      run = gap === 1 ? run + 1 : 1;
+    } else {
+      run = 1;
+    }
+    if (run > best) best = run;
+    previous = key;
+  });
+
+  return { current: current, best: Math.max(best, current) };
+}
+
+function buildDailyStats(conversations, vocabulary, windowDays) {
+  const today = new Date();
+  const days = windowDays || 14;
+
+  const byDay = new Map();
+  const activeDays = new Set();
+
+  (conversations || []).forEach(c => {
+    const key = dayKey(c.created_at);
+    if (!key) return;
+    const entry = byDay.get(key) || { sessions: 0, seconds: 0, mastered: 0, added: 0 };
+    entry.sessions += 1;
+    entry.seconds += c.duration_seconds || 0;
+    byDay.set(key, entry);
+    activeDays.add(key);
+  });
+
+  (vocabulary || []).forEach(v => {
+    const addedKey = dayKey(v.created_at);
+    if (addedKey) {
+      const entry = byDay.get(addedKey) || { sessions: 0, seconds: 0, mastered: 0, added: 0 };
+      entry.added += 1;
+      byDay.set(addedKey, entry);
+    }
+    if (v.status === 'mastered' && v.mastered_at) {
+      const masteredKey = dayKey(v.mastered_at);
+      if (masteredKey) {
+        const entry = byDay.get(masteredKey) || { sessions: 0, seconds: 0, mastered: 0, added: 0 };
+        entry.mastered += 1;
+        byDay.set(masteredKey, entry);
+      }
+    }
+  });
+
+  const series = [];
+  for (let i = days - 1; i >= 0; i--) {
+    const date = addDays(today, -i);
+    const key = dayKey(date);
+    const entry = byDay.get(key) || { sessions: 0, seconds: 0, mastered: 0, added: 0 };
+    series.push({
+      key: key,
+      date: date,
+      label: date.toLocaleDateString(undefined, { weekday: 'narrow' }),
+      minutes: Math.round(entry.seconds / 60),
+      sessions: entry.sessions,
+      mastered: entry.mastered,
+      added: entry.added
+    });
+  }
+
+  const todayEntry = byDay.get(dayKey(today)) || { sessions: 0, seconds: 0, mastered: 0, added: 0 };
+  const totalSeconds = (conversations || []).reduce((sum, c) => sum + (c.duration_seconds || 0), 0);
+  const streak = computeStreak(activeDays, today);
+
+  const weekSeconds = series.slice(-7).reduce((sum, d) => sum + d.minutes * 60, 0);
+
+  return {
+    today: {
+      sessions: todayEntry.sessions,
+      minutes: Math.round(todayEntry.seconds / 60),
+      mastered: todayEntry.mastered,
+      added: todayEntry.added
+    },
+    streak: streak,
+    series: series,
+    totals: {
+      sessions: (conversations || []).length,
+      minutes: Math.round(totalSeconds / 60),
+      learning: (vocabulary || []).filter(v => v.status === 'learning').length,
+      mastered: (vocabulary || []).filter(v => v.status === 'mastered').length,
+      weekMinutes: Math.round(weekSeconds / 60),
+      activeDays: activeDays.size
+    }
+  };
 }
 
 /* ------------------------------------------------------- phrase suggestions */
@@ -916,7 +1074,7 @@ const inputClass =
 
 /* -------------------------------------------------------------- setup screen */
 
-function SetupScreen({ initial, onSaved, onCancel, pushToast }) {
+function SetupScreen({ initial, onSaved, onCancel, pushToast, learnerId }) {
   const [openaiKey, setOpenaiKey] = useState(initial ? initial.openaiKey : '');
   const [supabaseUrl, setSupabaseUrl] = useState(initial ? initial.supabaseUrl : '');
   const [supabaseKey, setSupabaseKey] = useState(initial ? initial.supabaseKey : '');
@@ -955,7 +1113,12 @@ function SetupScreen({ initial, onSaved, onCancel, pushToast }) {
         throw new Error('Supabase: ' + probe.error.message + ' (check the URL, the anon key, that the tables exist, and that RLS allows anon access)');
       }
 
-      setStep('Checking the per-language schema…');
+      // On a first run there is no learner row yet, so make sure one exists
+      // before writing a profile that points at it.
+      setStep('Checking the schema…');
+      const learnerRows = await ensureLearner(client);
+      const who = (learnerId && learnerRows.some(l => l.id === learnerId)) ? learnerId : learnerRows[0].id;
+
       const langProbe = await client.from('target_vocabulary').select('target_language').limit(1);
       if (langProbe.error) {
         if (missingLanguageColumn(langProbe.error)) throw new Error(MIGRATION_HINT);
@@ -967,13 +1130,13 @@ function SetupScreen({ initial, onSaved, onCancel, pushToast }) {
       const existing = await client
         .from('profiles')
         .select('*')
-        .eq('user_id', DEFAULT_USER)
+        .eq('user_id', who)
         .eq('target_language', language)
         .maybeSingle();
       if (existing.error) throw new Error('Supabase: ' + existing.error.message);
 
       const profileRow = {
-        user_id: DEFAULT_USER,
+        user_id: who,
         target_language: language,
         current_cefr: cefr,
         vocab_injection_mode: mode
@@ -1003,6 +1166,7 @@ function SetupScreen({ initial, onSaved, onCancel, pushToast }) {
       const cfg = {
         openaiKey: key, supabaseUrl: url, supabaseKey: anon, voice: voice,
         targetLanguage: language,
+        learnerId: who,
         conversationMode: prevCfg.conversationMode || MODE_TURN
       };
       saveConfig(cfg);
@@ -1109,7 +1273,29 @@ function SetupScreen({ initial, onSaved, onCancel, pushToast }) {
   );
 }
 
-const SQL_SNIPPET = `-- New install: everything is scoped to (user_id, target_language)
+const SQL_SNIPPET = `-- New install. Rows are owned by a learner profile and scoped to one language.
+create table if not exists public.learners (
+  id text primary key,
+  name text not null,
+  emoji text not null default '🙂',
+  created_at timestamptz not null default now()
+);
+insert into public.learners (id, name) values ('default_user', 'Me')
+  on conflict (id) do nothing;
+
+-- Hard cap of five profiles, enforced in the database and not only in the UI.
+create or replace function public.enforce_learner_limit()
+returns trigger language plpgsql as $$
+begin
+  if (select count(*) from public.learners) >= 5 then
+    raise exception 'Profile limit reached: a maximum of 5 profiles is allowed';
+  end if;
+  return new;
+end; $$;
+drop trigger if exists learners_limit on public.learners;
+create trigger learners_limit before insert on public.learners
+  for each row execute function public.enforce_learner_limit();
+
 create table if not exists public.profiles (
   id uuid primary key default gen_random_uuid(),
   user_id text default 'default_user',
@@ -1128,6 +1314,7 @@ create table if not exists public.target_vocabulary (
   correction_context text,
   times_reviewed int default 0,
   status text default 'learning',
+  mastered_at timestamptz,
   created_at timestamptz default now()
 );
 
@@ -1147,26 +1334,8 @@ create index if not exists target_vocabulary_scope
 create index if not exists conversations_scope
   on public.conversations (user_id, target_language, created_at desc);
 
--- Already have the single-language tables? Run this migration instead.
--- It backfills existing rows with the language from your old profile.
---
--- alter table public.target_vocabulary add column if not exists target_language text;
--- alter table public.conversations   add column if not exists target_language text;
---
--- update public.target_vocabulary tv set target_language = p.target_language
---   from public.profiles p where p.user_id = tv.user_id and tv.target_language is null;
--- update public.conversations c set target_language = p.target_language
---   from public.profiles p where p.user_id = c.user_id and c.target_language is null;
---
--- update public.target_vocabulary set target_language = 'German' where target_language is null;
--- update public.conversations   set target_language = 'German' where target_language is null;
---
--- alter table public.target_vocabulary alter column target_language set not null;
--- alter table public.conversations   alter column target_language set not null;
---
--- alter table public.profiles drop constraint if exists profiles_user_id_key;
--- alter table public.profiles add constraint profiles_user_language_key
---   unique (user_id, target_language);`;
+-- Upgrading an older database? The repo carries both migrations under
+-- supabase/migrations, so "supabase db push" applies them in order.`;
 
 /* ---------------------------------------------------------------- dashboard */
 
@@ -1213,6 +1382,232 @@ function VocabBar({ vocab, loading, onSuggest }) {
           </div>
         );
       })}
+    </div>
+  );
+}
+
+function ProfileSheet({ learners, activeId, busy, onSwitch, onCreate, onDelete, onClose }) {
+  const [creating, setCreating] = useState(false);
+  const [name, setName] = useState('');
+  const [emoji, setEmoji] = useState(PROFILE_EMOJI[0]);
+  const [confirmingId, setConfirmingId] = useState('');
+
+  const full = learners.length >= MAX_PROFILES;
+
+  function submit(e) {
+    e.preventDefault();
+    if (!name.trim()) return;
+    onCreate(name, emoji);
+    setName('');
+    setCreating(false);
+  }
+
+  return (
+    <div className="fixed inset-0 z-40 flex flex-col justify-end">
+      <div className="fade-in absolute inset-0 bg-black/60 backdrop-blur-sm" onClick={busy ? undefined : onClose} />
+      <div className="sheet-up relative flex max-h-[88vh] flex-col rounded-t-3xl border-t border-gray-700 bg-gray-900 shadow-2xl">
+        <div className="mx-auto mt-3 h-1.5 w-10 shrink-0 rounded-full bg-gray-700" />
+
+        <div className="mx-auto w-full max-w-md px-5 pt-4">
+          <div className="flex items-center justify-between">
+            <h2 className="text-lg font-semibold tracking-tight">Profiles</h2>
+            <button onClick={onClose} disabled={busy}
+              className="no-tap rounded-lg p-1.5 text-gray-400 transition hover:text-white disabled:opacity-40" aria-label="Close">
+              <svg className="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+                <path d="M18 6 6 18M6 6l12 12" />
+              </svg>
+            </button>
+          </div>
+          <p className="mt-1 text-sm text-gray-400">
+            {learners.length} of {MAX_PROFILES} used. Each profile keeps its own languages, vocabulary and streak.
+          </p>
+        </div>
+
+        <div className="mx-auto w-full max-w-md flex-1 overflow-y-auto px-5 pb-4 pt-4">
+          <div className="space-y-2">
+            {learners.map(l => {
+              const active = l.id === activeId;
+              const confirming = confirmingId === l.id;
+              return (
+                <div key={l.id}
+                  className={'rounded-xl border p-3 transition ' + (active
+                    ? 'border-indigo-500 bg-indigo-500/10'
+                    : 'border-gray-700 bg-gray-800')}>
+                  <div className="flex items-center gap-3">
+                    <button type="button" onClick={() => onSwitch(l.id)} disabled={busy || active}
+                      className="no-tap flex min-w-0 flex-1 items-center gap-3 text-left disabled:cursor-default">
+                      <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-gray-900/70 text-lg">
+                        {l.emoji || '🙂'}
+                      </span>
+                      <span className="min-w-0 flex-1">
+                        <span className="block truncate text-sm font-medium text-white">{l.name}</span>
+                        <span className="block text-xs text-gray-500">{active ? 'Active now' : 'Tap to switch'}</span>
+                      </span>
+                    </button>
+                    {learners.length > 1 ? (
+                      <button type="button" disabled={busy}
+                        onClick={() => (confirming ? onDelete(l.id) : setConfirmingId(l.id))}
+                        className={'no-tap shrink-0 rounded-lg px-2.5 py-1.5 text-xs font-medium transition disabled:opacity-40 ' + (confirming
+                          ? 'bg-red-600 text-white'
+                          : 'border border-gray-700 text-gray-400 hover:text-white')}>
+                        {confirming ? 'Delete for good' : 'Delete'}
+                      </button>
+                    ) : null}
+                  </div>
+                  {confirming ? (
+                    <p className="mt-2 border-t border-gray-700/60 pt-2 text-xs leading-relaxed text-red-300">
+                      This erases {l.name}'s vocabulary, sessions and levels in every language. It cannot be undone.
+                      <button type="button" onClick={() => setConfirmingId('')}
+                        className="no-tap ml-2 text-gray-400 underline">Cancel</button>
+                    </p>
+                  ) : null}
+                </div>
+              );
+            })}
+          </div>
+
+          {creating ? (
+            <form onSubmit={submit} className="mt-4 rounded-xl border border-gray-800 bg-gray-800/40 p-3.5">
+              <div className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-gray-500">New profile</div>
+              <input className={inputClass} type="text" value={name} autoFocus disabled={busy}
+                onChange={e => setName(e.target.value)} placeholder="Name" maxLength={40} />
+              <div className="mt-2 flex flex-wrap gap-1.5">
+                {PROFILE_EMOJI.map(e => (
+                  <button key={e} type="button" onClick={() => setEmoji(e)}
+                    className={'no-tap flex h-9 w-9 items-center justify-center rounded-lg border text-lg transition ' + (emoji === e
+                      ? 'border-indigo-500 bg-indigo-500/20'
+                      : 'border-gray-700 bg-gray-900 hover:border-gray-600')}>
+                    {e}
+                  </button>
+                ))}
+              </div>
+              <div className="mt-3 flex gap-2">
+                <button type="submit" disabled={busy || !name.trim()}
+                  className="no-tap flex-1 rounded-xl bg-indigo-600 px-4 py-2.5 text-sm font-semibold text-white transition hover:bg-indigo-500 disabled:opacity-50">
+                  Create
+                </button>
+                <button type="button" onClick={() => setCreating(false)} disabled={busy}
+                  className="no-tap rounded-xl border border-gray-700 px-4 py-2.5 text-sm text-gray-300 transition hover:text-white">
+                  Cancel
+                </button>
+              </div>
+            </form>
+          ) : (
+            <button type="button" onClick={() => setCreating(true)} disabled={busy || full}
+              className="no-tap mt-4 w-full rounded-xl border border-dashed border-gray-700 px-4 py-3 text-sm font-medium text-gray-300 transition hover:border-gray-600 hover:text-white disabled:opacity-40">
+              {full ? 'Profile limit reached (' + MAX_PROFILES + ')' : '+ New profile'}
+            </button>
+          )}
+
+          <div className="mt-3 flex h-5 items-center gap-2 text-xs text-gray-500">
+            {busy ? <Spinner className="h-3.5 w-3.5" /> : null}
+            <span>{busy ? 'Working…' : ''}</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function StatsSheet({ stats, loading, language, learnerName, onClose }) {
+  const peak = stats ? Math.max(1, ...stats.series.map(d => d.minutes)) : 1;
+
+  return (
+    <div className="fixed inset-0 z-40 flex flex-col justify-end">
+      <div className="fade-in absolute inset-0 bg-black/60 backdrop-blur-sm" onClick={onClose} />
+      <div className="sheet-up relative flex max-h-[88vh] flex-col rounded-t-3xl border-t border-gray-700 bg-gray-900 shadow-2xl">
+        <div className="mx-auto mt-3 h-1.5 w-10 shrink-0 rounded-full bg-gray-700" />
+
+        <div className="mx-auto w-full max-w-md px-5 pt-4">
+          <div className="flex items-center justify-between">
+            <h2 className="text-lg font-semibold tracking-tight">Your progress</h2>
+            <button onClick={onClose}
+              className="no-tap rounded-lg p-1.5 text-gray-400 transition hover:text-white" aria-label="Close">
+              <svg className="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+                <path d="M18 6 6 18M6 6l12 12" />
+              </svg>
+            </button>
+          </div>
+          <p className="mt-1 text-sm text-gray-400">{learnerName} · {language}</p>
+        </div>
+
+        <div className="mx-auto w-full max-w-md flex-1 overflow-y-auto px-5 pb-8 pt-4">
+          {loading || !stats ? (
+            <div className="flex justify-center py-10 text-gray-500"><Spinner className="h-6 w-6" /></div>
+          ) : (
+            <div className="space-y-4">
+              <div className="flex items-center gap-3 rounded-2xl border border-gray-800 bg-gradient-to-br from-indigo-500/15 to-gray-800/40 p-4">
+                <div className="flex h-14 w-14 shrink-0 items-center justify-center rounded-2xl bg-gray-900/60 text-2xl">
+                  {stats.streak.current > 0 ? '🔥' : '🌱'}
+                </div>
+                <div className="min-w-0">
+                  <div className="text-2xl font-semibold tracking-tight">
+                    {stats.streak.current} day{stats.streak.current === 1 ? '' : 's'}
+                  </div>
+                  <div className="text-sm text-gray-400">
+                    {stats.streak.current > 0
+                      ? 'Current streak · best ' + stats.streak.best
+                      : 'No streak yet. One session starts it.'}
+                  </div>
+                </div>
+              </div>
+
+              <div>
+                <div className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-gray-500">Today</div>
+                <div className="grid grid-cols-4 gap-2">
+                  {[
+                    { label: 'min', value: stats.today.minutes },
+                    { label: 'sessions', value: stats.today.sessions },
+                    { label: 'new', value: stats.today.added },
+                    { label: 'mastered', value: stats.today.mastered }
+                  ].map(cell => (
+                    <div key={cell.label} className="rounded-xl border border-gray-800 bg-gray-800/50 p-2.5 text-center">
+                      <div className="text-lg font-semibold tabular-nums text-white">{cell.value}</div>
+                      <div className="text-[10px] uppercase tracking-wide text-gray-500">{cell.label}</div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              <div className="rounded-2xl border border-gray-800 bg-gray-800/40 p-4">
+                <div className="mb-3 flex items-baseline justify-between">
+                  <span className="text-[11px] font-semibold uppercase tracking-wider text-gray-500">Last 14 days</span>
+                  <span className="text-xs text-gray-500">{stats.totals.weekMinutes} min this week</span>
+                </div>
+                <div className="flex h-24 items-end gap-1">
+                  {stats.series.map(d => (
+                    <div key={d.key} className="group flex flex-1 flex-col items-center justify-end gap-1"
+                      title={d.key + ': ' + d.minutes + ' min'}>
+                      <div className={'w-full rounded-t transition-all ' + (d.minutes > 0 ? 'bg-indigo-500' : 'bg-gray-700/60')}
+                        style={{ height: Math.max(d.minutes > 0 ? 6 : 2, Math.round((d.minutes / peak) * 84)) + 'px' }} />
+                      <span className="text-[9px] text-gray-600">{d.label}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              <div>
+                <div className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-gray-500">All time</div>
+                <div className="grid grid-cols-2 gap-2">
+                  {[
+                    { label: 'Minutes spoken', value: stats.totals.minutes },
+                    { label: 'Sessions', value: stats.totals.sessions },
+                    { label: 'Phrases learning', value: stats.totals.learning },
+                    { label: 'Phrases mastered', value: stats.totals.mastered },
+                    { label: 'Days practised', value: stats.totals.activeDays },
+                    { label: 'Best streak', value: stats.streak.best }
+                  ].map(cell => (
+                    <div key={cell.label} className="rounded-xl border border-gray-800 bg-gray-800/50 p-3">
+                      <div className="text-xl font-semibold tabular-nums text-white">{cell.value}</div>
+                      <div className="mt-0.5 text-xs text-gray-500">{cell.label}</div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
     </div>
   );
 }
@@ -1449,7 +1844,8 @@ function ExportSheet({ vocab, targetLanguage, defaultTurkish, busy, note, onExpo
 function Dashboard({
   profile, vocab, vocabLoading, recommendedTopic, recommendedSource,
   stats, onStart, onOpenSettings, onShowLastFeedback, hasLastFeedback, onExport,
-  mode, onModeChange, onSuggest, language, onLanguageChange, switchingLanguage
+  mode, onModeChange, onSuggest, language, onLanguageChange, switchingLanguage,
+  learner, learnerCount, onOpenProfiles, dailyStats, onOpenStats
 }) {
   const [custom, setCustom] = useState('');
   const chosen = custom.trim() || recommendedTopic;
@@ -1479,6 +1875,17 @@ function Dashboard({
             {stats.sessions} {profile.target_language} session{stats.sessions === 1 ? '' : 's'} done · {stats.mastered} phrase{stats.mastered === 1 ? '' : 's'} mastered
           </p>
         </div>
+        <div className="flex items-center gap-2">
+        <button onClick={onOpenProfiles}
+          className="no-tap flex items-center gap-1.5 rounded-xl border border-gray-700 bg-gray-800 py-1.5 pl-1.5 pr-2.5 text-gray-300 transition hover:border-gray-600 hover:text-white"
+          title="Switch profile"
+          aria-label="Profiles">
+          <span className="flex h-6 w-6 items-center justify-center rounded-full bg-gray-900/70 text-sm">
+            {learner ? learner.emoji || '🙂' : '🙂'}
+          </span>
+          <span className="max-w-[70px] truncate text-xs font-medium">{learner ? learner.name : 'Profile'}</span>
+          {learnerCount > 1 ? <span className="text-[10px] text-gray-500">{learnerCount}</span> : null}
+        </button>
         <button onClick={onOpenSettings}
           className="no-tap rounded-xl border border-gray-700 bg-gray-800 p-2.5 text-gray-400 transition hover:text-white"
           aria-label="Settings">
@@ -1487,7 +1894,34 @@ function Dashboard({
             <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.6a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
           </svg>
         </button>
+        </div>
       </header>
+
+      <button onClick={onOpenStats}
+        className="no-tap mb-7 flex w-full items-center gap-3 rounded-2xl border border-gray-800 bg-gray-800/50 p-3.5 text-left transition hover:border-gray-700">
+        <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-gray-900/70 text-xl">
+          {dailyStats && dailyStats.streak.current > 0 ? '🔥' : '🌱'}
+        </span>
+        <span className="min-w-0 flex-1">
+          <span className="block text-sm font-medium text-white">
+            {dailyStats
+              ? (dailyStats.streak.current > 0
+                  ? dailyStats.streak.current + ' day streak'
+                  : 'Start a streak today')
+              : 'Your progress'}
+          </span>
+          <span className="block text-xs text-gray-400">
+            {dailyStats
+              ? (dailyStats.today.minutes > 0
+                  ? dailyStats.today.minutes + ' min today · ' + dailyStats.today.sessions + ' session' + (dailyStats.today.sessions === 1 ? '' : 's')
+                  : 'Nothing logged today yet')
+              : 'Tap to see your daily stats'}
+          </span>
+        </span>
+        <svg className="h-4 w-4 shrink-0 text-gray-600" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+          <path d="m9 18 6-6-6-6" />
+        </svg>
+      </button>
 
       <section className="mb-7">
         <div className="mb-2.5 flex items-baseline justify-between">
@@ -1874,6 +2308,16 @@ function App() {
     const cfg = loadConfig();
     return (cfg && cfg.targetLanguage) || 'German';
   });
+  const [learners, setLearners] = useState([]);
+  const [learnerId, setLearnerId] = useState(() => {
+    const cfg = loadConfig();
+    return (cfg && cfg.learnerId) || DEFAULT_USER;
+  });
+  const [profilesOpen, setProfilesOpen] = useState(false);
+  const [profilesBusy, setProfilesBusy] = useState(false);
+  const [statsOpen, setStatsOpen] = useState(false);
+  const [statsLoading, setStatsLoading] = useState(false);
+  const [dailyStats, setDailyStats] = useState(null);
   const [switchingLanguage, setSwitchingLanguage] = useState(false);
   const [screen, setScreen] = useState(loadConfig() ? 'loading' : 'setup');
   const [toast, setToast] = useState(null);
@@ -1923,11 +2367,13 @@ function App() {
   const realtimeItemsRef = useRef([]);
   const modeRef = useRef(MODE_TURN);
   const languageRef = useRef('German');
+  const learnerRef = useRef(DEFAULT_USER);
 
   useEffect(() => { messagesRef.current = messages; }, [messages]);
   useEffect(() => { statusRef.current = status; }, [status]);
   useEffect(() => { modeRef.current = mode; }, [mode]);
   useEffect(() => { languageRef.current = language; }, [language]);
+  useEffect(() => { learnerRef.current = learnerId; }, [learnerId]);
 
   const changeMode = useCallback((next) => {
     setMode(next);
@@ -1986,13 +2432,14 @@ function App() {
 
   /* --------------------------------------------------------- data fetching */
 
-  const refreshVocab = useCallback(async (c, languageOverride) => {
+  const refreshVocab = useCallback(async (c, languageOverride, learnerOverride) => {
     const db = c || client;
     const lang = languageOverride || languageRef.current;
-    if (!db || !lang) return [];
+    const who = learnerOverride || learnerRef.current;
+    if (!db || !lang || !who) return [];
     setVocabLoading(true);
     try {
-      const res = await scoped(db.from('target_vocabulary').select('*'), lang)
+      const res = await scoped(db.from('target_vocabulary').select('*'), who, lang)
         .eq('status', 'learning')
         .order('created_at', { ascending: true });
       if (res.error) throw new Error(missingLanguageColumn(res.error) ? MIGRATION_HINT : res.error.message);
@@ -2007,14 +2454,15 @@ function App() {
     }
   }, [client, pushToast]);
 
-  const refreshStats = useCallback(async (c, languageOverride) => {
+  const refreshStats = useCallback(async (c, languageOverride, learnerOverride) => {
     const db = c || client;
     const lang = languageOverride || languageRef.current;
-    if (!db || !lang) return;
+    const who = learnerOverride || learnerRef.current;
+    if (!db || !lang || !who) return;
     try {
       const [sessionsRes, masteredRes] = await Promise.all([
-        scoped(db.from('conversations').select('id', { count: 'exact', head: true }), lang),
-        scoped(db.from('target_vocabulary').select('id', { count: 'exact', head: true }), lang).eq('status', 'mastered')
+        scoped(db.from('conversations').select('id', { count: 'exact', head: true }), who, lang),
+        scoped(db.from('target_vocabulary').select('id', { count: 'exact', head: true }), who, lang).eq('status', 'mastered')
       ]);
       setStats({
         sessions: sessionsRes.count || 0,
@@ -2025,12 +2473,13 @@ function App() {
     }
   }, [client]);
 
-  const refreshRecommendedTopic = useCallback(async (c, vocabRows, languageOverride) => {
+  const refreshRecommendedTopic = useCallback(async (c, vocabRows, languageOverride, learnerOverride) => {
     const db = c || client;
     const lang = languageOverride || languageRef.current;
-    if (!db || !lang) return;
+    const who = learnerOverride || learnerRef.current;
+    if (!db || !lang || !who) return;
     try {
-      const res = await scoped(db.from('conversations').select('feedback, topic, created_at'), lang)
+      const res = await scoped(db.from('conversations').select('feedback, topic, created_at'), who, lang)
         .order('created_at', { ascending: false })
         .limit(1);
       if (res.error) throw new Error(res.error.message);
@@ -2061,6 +2510,36 @@ function App() {
     }
   }, [client, vocab]);
 
+  /* -------------------------------------------------------------- daily stats */
+
+  const refreshDailyStats = useCallback(async (c, languageOverride, learnerOverride) => {
+    const db = c || client;
+    const lang = languageOverride || languageRef.current;
+    const who = learnerOverride || learnerRef.current;
+    if (!db || !lang || !who) return;
+
+    setStatsLoading(true);
+    try {
+      const [convRes, vocabRes] = await Promise.all([
+        scoped(db.from('conversations').select('created_at, duration_seconds'), who, lang),
+        scoped(db.from('target_vocabulary').select('created_at, status, mastered_at'), who, lang)
+      ]);
+      if (convRes.error) throw new Error(convRes.error.message);
+      if (vocabRes.error) throw new Error(vocabRes.error.message);
+      setDailyStats(buildDailyStats(convRes.data || [], vocabRes.data || [], 14));
+    } catch (err) {
+      console.error(err);
+      pushToast('error', 'Could not load progress: ' + err.message);
+    } finally {
+      setStatsLoading(false);
+    }
+  }, [client, pushToast]);
+
+  const openStats = useCallback(() => {
+    setStatsOpen(true);
+    refreshDailyStats();
+  }, [refreshDailyStats]);
+
   /* ------------------------------------------------------------ boot / init */
 
   useEffect(() => {
@@ -2075,25 +2554,35 @@ function App() {
         if (cancelled) return;
         setClient(db);
 
+        const learnerRows = await ensureLearner(db);
+        if (cancelled) return;
+        setLearners(learnerRows);
+
+        const wanted = cfg.learnerId || DEFAULT_USER;
+        const activeLearner = learnerRows.some(l => l.id === wanted) ? wanted : learnerRows[0].id;
+        learnerRef.current = activeLearner;
+        setLearnerId(activeLearner);
+
         const activeLanguage = cfg.targetLanguage || 'German';
         languageRef.current = activeLanguage;
         setLanguage(activeLanguage);
 
-        const row = await loadOrCreateProfile(db, activeLanguage, null);
+        const row = await loadOrCreateProfile(db, activeLearner, activeLanguage, null);
         if (cancelled) return;
         setProfile(row);
         setScreen('dashboard');
 
-        const rows = await refreshVocab(db, activeLanguage);
+        const rows = await refreshVocab(db, activeLanguage, activeLearner);
         if (cancelled) return;
         await Promise.all([
-          refreshStats(db, activeLanguage),
-          refreshRecommendedTopic(db, rows, activeLanguage)
+          refreshStats(db, activeLanguage, activeLearner),
+          refreshRecommendedTopic(db, rows, activeLanguage, activeLearner),
+          refreshDailyStats(db, activeLanguage, activeLearner)
         ]);
       } catch (err) {
         if (cancelled) return;
         console.error(err);
-        pushToast('error', missingLanguageColumn(err)
+        pushToast('error', (missingLanguageColumn(err) || missingLearnersTable(err))
           ? MIGRATION_HINT
           : 'Connection failed: ' + err.message + ' — check your settings.');
         setScreen('setup');
@@ -2479,6 +2968,7 @@ function App() {
     const sessionTopic = topic;
     // Pin the language at end time so a mid-analysis switch cannot misfile rows.
     const sessionLanguage = languageRef.current;
+    const sessionLearner = learnerRef.current;
     const sessionVocab = sessionVocabRef.current.slice();
 
     const userTurns = transcript.filter(m => m.role === 'user');
@@ -2548,14 +3038,14 @@ function App() {
     // 1. Insert newly recommended phrases (skip ones already tracked).
     try {
       if (analysis.recommended_phrases.length && client) {
-        const existing = await scoped(client.from('target_vocabulary').select('phrase'), sessionLanguage);
+        const existing = await scoped(client.from('target_vocabulary').select('phrase'), sessionLearner, sessionLanguage);
         if (existing.error) throw new Error(existing.error.message);
 
         const known = new Set((existing.data || []).map(r => normalizeText(r.phrase)));
         const rows = analysis.recommended_phrases
           .filter(p => p && p.phrase && !known.has(normalizeText(p.phrase)))
           .map(p => ({
-            user_id: DEFAULT_USER,
+            user_id: sessionLearner,
             target_language: sessionLanguage,
             phrase: String(p.phrase).trim(),
             translation: p.translation ? String(p.translation).trim() : null,
@@ -2578,9 +3068,12 @@ function App() {
     try {
       if (progressed.length && client) {
         for (const p of progressed) {
+          const patch = { times_reviewed: p.times_reviewed, status: p.status };
+          // Stamp the promotion so daily progress can report what was mastered when.
+          if (p.status === 'mastered') patch.mastered_at = new Date().toISOString();
           const upd = await client
             .from('target_vocabulary')
-            .update({ times_reviewed: p.times_reviewed, status: p.status })
+            .update(patch)
             .eq('id', p.id);
           if (upd.error) throw new Error(upd.error.message);
         }
@@ -2594,7 +3087,7 @@ function App() {
     try {
       if (client) {
         const ins = await client.from('conversations').insert({
-          user_id: DEFAULT_USER,
+          user_id: sessionLearner,
           target_language: sessionLanguage,
           topic: sessionTopic,
           duration_seconds: usedSeconds,
@@ -2620,13 +3113,126 @@ function App() {
       setSaveNote('Saved' + (bits.length ? ' · ' + bits.join(' · ') : '') + '.');
     }
 
-    const rows = await refreshVocab(client, sessionLanguage);
+    const rows = await refreshVocab(client, sessionLanguage, sessionLearner);
     await Promise.all([
-      refreshStats(client, sessionLanguage),
-      refreshRecommendedTopic(client, rows, sessionLanguage)
+      refreshStats(client, sessionLanguage, sessionLearner),
+      refreshRecommendedTopic(client, rows, sessionLanguage, sessionLearner),
+      refreshDailyStats(client, sessionLanguage, sessionLearner)
     ]);
     endingRef.current = false;
-  }, [client, config, profile, topic, secondsLeft, releaseMic, stopPlayback, teardownRealtime, pushToast, refreshVocab, refreshStats, refreshRecommendedTopic]);
+  }, [client, config, profile, topic, secondsLeft, releaseMic, stopPlayback, teardownRealtime, pushToast, refreshVocab, refreshStats, refreshRecommendedTopic, refreshDailyStats]);
+
+  /* ------------------------------------------------------- learner profiles */
+
+  const activeLearner = useMemo(
+    () => learners.find(l => l.id === learnerId) || null,
+    [learners, learnerId]
+  );
+
+  // Switching profile reloads the whole workspace for that person: their
+  // language, their level, their vocabulary, their history.
+  const switchLearner = useCallback(async (nextId) => {
+    if (!client || !nextId || nextId === learnerId) return;
+
+    setProfilesBusy(true);
+    try {
+      const lang = languageRef.current;
+      const row = await loadOrCreateProfile(client, nextId, lang, null);
+
+      learnerRef.current = nextId;
+      setLearnerId(nextId);
+      setProfile(row);
+      setVocab([]);
+      setFeedback(null);
+      setSheetOpen(false);
+      setSuggestItems([]);
+      turkishCacheRef.current = new Map();
+
+      const cfg = loadConfig();
+      if (cfg) saveConfig(Object.assign({}, cfg, { learnerId: nextId }));
+      setConfig(loadConfig());
+
+      const rows = await refreshVocab(client, lang, nextId);
+      await Promise.all([
+        refreshStats(client, lang, nextId),
+        refreshRecommendedTopic(client, rows, lang, nextId),
+        refreshDailyStats(client, lang, nextId)
+      ]);
+      setProfilesOpen(false);
+      const who = learners.find(l => l.id === nextId);
+      pushToast('success', 'Switched to ' + (who ? who.name : 'profile') + '.');
+    } catch (err) {
+      console.error(err);
+      pushToast('error', 'Could not switch profile: ' + err.message);
+    } finally {
+      setProfilesBusy(false);
+    }
+  }, [client, learnerId, learners, refreshVocab, refreshStats, refreshRecommendedTopic, refreshDailyStats, pushToast]);
+
+  const createLearner = useCallback(async (name, emoji) => {
+    if (!client) return;
+    const clean = (name || '').trim();
+    if (!clean) return;
+
+    if (learners.length >= MAX_PROFILES) {
+      pushToast('error', 'You already have the maximum of ' + MAX_PROFILES + ' profiles.');
+      return;
+    }
+
+    setProfilesBusy(true);
+    try {
+      const ins = await client
+        .from('learners')
+        .insert({ id: newLearnerId(), name: clean, emoji: emoji || PROFILE_EMOJI[0] })
+        .select()
+        .single();
+      // The database enforces the cap too, so a race still fails cleanly here.
+      if (ins.error) throw new Error(ins.error.message);
+
+      const rows = await fetchLearners(client);
+      setLearners(rows);
+      pushToast('success', 'Created ' + clean + '.');
+      await switchLearner(ins.data.id);
+    } catch (err) {
+      console.error(err);
+      pushToast('error', 'Could not create profile: ' + err.message);
+    } finally {
+      setProfilesBusy(false);
+    }
+  }, [client, learners, pushToast, switchLearner]);
+
+  // Deleting a profile removes that person's vocabulary, history and settings.
+  // The UI asks twice before calling this.
+  const deleteLearner = useCallback(async (id) => {
+    if (!client || !id) return;
+    if (learners.length <= 1) {
+      pushToast('error', 'You cannot delete your only profile.');
+      return;
+    }
+
+    setProfilesBusy(true);
+    try {
+      for (const table of ['target_vocabulary', 'conversations', 'profiles']) {
+        const del = await client.from(table).delete().eq('user_id', id);
+        if (del.error) throw new Error(table + ': ' + del.error.message);
+      }
+      const delLearner = await client.from('learners').delete().eq('id', id);
+      if (delLearner.error) throw new Error(delLearner.error.message);
+
+      const rows = await fetchLearners(client);
+      setLearners(rows);
+      pushToast('success', 'Profile deleted.');
+
+      if (id === learnerRef.current && rows.length) {
+        await switchLearner(rows[0].id);
+      }
+    } catch (err) {
+      console.error(err);
+      pushToast('error', 'Could not delete profile: ' + err.message);
+    } finally {
+      setProfilesBusy(false);
+    }
+  }, [client, learners, pushToast, switchLearner]);
 
   /* -------------------------------------------------------- language switch */
 
@@ -2637,7 +3243,7 @@ function App() {
 
     setSwitchingLanguage(true);
     try {
-      const row = await loadOrCreateProfile(client, nextLanguage, null);
+      const row = await loadOrCreateProfile(client, learnerRef.current, nextLanguage, null);
 
       languageRef.current = nextLanguage;
       setLanguage(nextLanguage);
@@ -2655,7 +3261,8 @@ function App() {
       const rows = await refreshVocab(client, nextLanguage);
       await Promise.all([
         refreshStats(client, nextLanguage),
-        refreshRecommendedTopic(client, rows, nextLanguage)
+        refreshRecommendedTopic(client, rows, nextLanguage),
+        refreshDailyStats(client, nextLanguage)
       ]);
       pushToast('success', 'Switched to ' + nextLanguage + ' · ' + row.current_cefr + '.');
     } catch (err) {
@@ -2664,13 +3271,13 @@ function App() {
     } finally {
       setSwitchingLanguage(false);
     }
-  }, [client, language, refreshVocab, refreshStats, refreshRecommendedTopic, pushToast]);
+  }, [client, language, refreshVocab, refreshStats, refreshRecommendedTopic, refreshDailyStats, pushToast]);
 
   /* ---------------------------------------------------- phrase suggestions */
 
   const fetchKnownPhrases = useCallback(async () => {
     if (!client) return [];
-    const res = await scoped(client.from('target_vocabulary').select('phrase'), languageRef.current);
+    const res = await scoped(client.from('target_vocabulary').select('phrase'), learnerRef.current, languageRef.current);
     if (res.error) throw new Error(res.error.message);
     return (res.data || []).map(r => r.phrase).filter(Boolean);
   }, [client]);
@@ -2743,7 +3350,7 @@ function App() {
       const rows = chosen
         .filter(it => !knownKeys.has(normalizeText(it.phrase)))
         .map(it => ({
-          user_id: DEFAULT_USER,
+          user_id: learnerRef.current,
           target_language: languageRef.current,
           phrase: it.phrase,
           translation: it.translation || null,
@@ -2854,14 +3461,25 @@ function App() {
 
   const handleSetupSaved = useCallback(async (cfg, db, savedProfile) => {
     const lang = savedProfile.target_language;
+    const who = savedProfile.user_id;
     languageRef.current = lang;
+    learnerRef.current = who;
     setLanguage(lang);
+    setLearnerId(who);
     setConfig(cfg);
     setClient(db);
     setProfile(savedProfile);
     setScreen('dashboard');
-    const rows = await refreshVocab(db, lang);
-    await Promise.all([refreshStats(db, lang), refreshRecommendedTopic(db, rows, lang)]);
+    try {
+      setLearners(await fetchLearners(db));
+    } catch (err) {
+      console.warn('Could not list profiles', err);
+    }
+    const rows = await refreshVocab(db, lang, who);
+    await Promise.all([
+      refreshStats(db, lang, who),
+      refreshRecommendedTopic(db, rows, lang, who)
+    ]);
   }, [refreshVocab, refreshStats, refreshRecommendedTopic]);
 
   /* ---------------------------------------------------------------- render */
@@ -2889,6 +3507,7 @@ function App() {
         <Toast toast={toast} onDismiss={dismissToast} />
         <SetupScreen
           initial={initial}
+          learnerId={learnerId}
           onSaved={handleSetupSaved}
           onCancel={screen === 'settings' && profile ? () => setScreen('dashboard') : null}
           pushToast={pushToast}
@@ -2943,8 +3562,35 @@ function App() {
           language={language}
           onLanguageChange={switchLanguage}
           switchingLanguage={switchingLanguage}
+          learner={activeLearner}
+          learnerCount={learners.length}
+          onOpenProfiles={() => setProfilesOpen(true)}
+          dailyStats={dailyStats}
+          onOpenStats={openStats}
         />
       )}
+
+      {profilesOpen ? (
+        <ProfileSheet
+          learners={learners}
+          activeId={learnerId}
+          busy={profilesBusy}
+          onSwitch={switchLearner}
+          onCreate={createLearner}
+          onDelete={deleteLearner}
+          onClose={() => setProfilesOpen(false)}
+        />
+      ) : null}
+
+      {statsOpen && profile ? (
+        <StatsSheet
+          stats={dailyStats}
+          loading={statsLoading}
+          language={profile.target_language}
+          learnerName={activeLearner ? activeLearner.name : 'You'}
+          onClose={() => setStatsOpen(false)}
+        />
+      ) : null}
 
       {suggestOpen && profile ? (
         <SuggestSheet

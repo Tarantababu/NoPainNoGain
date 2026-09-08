@@ -14,6 +14,8 @@ No build step, no bundler, no server. Open `index.html` and it runs: React 18, B
 - **Turns your errors into a vocabulary list**, then works those phrases back into later sessions until you have actually used each one three times.
 - **Suggests phrases proactively** too, so you are not limited to fixing past mistakes.
 - **Keeps every language separate.** Your German level, vocabulary and history never touch your Spanish ones.
+- **Up to five learner profiles**, each with completely independent progress.
+- **Daily stats and streaks** so you can see the habit forming.
 - **Exports your vocabulary** as CSV or plain text, with Turkish translations.
 
 ---
@@ -22,9 +24,38 @@ No build step, no bundler, no server. Open `index.html` and it runs: React 18, B
 
 ### 1. Create the Supabase tables
 
-Run this in the Supabase SQL editor (it is also shown inside the app on the setup screen):
+The repo carries the schema as migrations, so the quickest path is:
+
+```bash
+supabase link --project-ref <your-project-ref>
+supabase db push
+```
+
+Or paste this into the Supabase SQL editor (it is also shown inside the app on the setup screen):
 
 ```sql
+create table if not exists public.learners (
+  id text primary key,
+  name text not null,
+  emoji text not null default '🙂',
+  created_at timestamptz not null default now()
+);
+insert into public.learners (id, name) values ('default_user', 'Me')
+  on conflict (id) do nothing;
+
+-- Hard cap of five profiles, enforced in the database and not only in the UI.
+create or replace function public.enforce_learner_limit()
+returns trigger language plpgsql as $$
+begin
+  if (select count(*) from public.learners) >= 5 then
+    raise exception 'Profile limit reached: a maximum of 5 profiles is allowed';
+  end if;
+  return new;
+end; $$;
+drop trigger if exists learners_limit on public.learners;
+create trigger learners_limit before insert on public.learners
+  for each row execute function public.enforce_learner_limit();
+
 create table if not exists public.profiles (
   id uuid primary key default gen_random_uuid(),
   user_id text default 'default_user',
@@ -43,6 +74,7 @@ create table if not exists public.target_vocabulary (
   correction_context text,
   times_reviewed int default 0,
   status text default 'learning',
+  mastered_at timestamptz,
   created_at timestamptz default now()
 );
 
@@ -63,7 +95,7 @@ create index if not exists conversations_scope
   on public.conversations (user_id, target_language, created_at desc);
 ```
 
-Every learner-owned row is keyed by **(user_id, target_language)**. See [Multiple languages](#multiple-languages).
+Every learner-owned row is keyed by **(user_id, target_language)** — `user_id` is the learner profile. See [Profiles](#profiles) and [Multiple languages](#multiple-languages).
 
 <details>
 <summary><strong>Upgrading from the single-language schema?</strong></summary>
@@ -127,6 +159,29 @@ On first run the app asks for:
 | Partner voice | Voice used for the spoken replies |
 
 **Test & Save** verifies the OpenAI key, probes the Supabase tables and writes your profile before letting you through. Everything is stored under the `fluentloop.config.v1` key in `localStorage` — nothing is sent anywhere else.
+
+---
+
+## Profiles
+
+Up to **five learner profiles** share one install — useful for a couple, a family, or keeping a serious language apart from a casual one. Tap the profile chip in the dashboard header to switch, rename or create.
+
+Each profile owns its languages, levels, vocabulary, session history and streak. Nothing is shared between them.
+
+The five-profile cap is enforced by a database trigger, not just the UI, so a stray tab or a direct API call cannot exceed it either. Deleting a profile erases that person's vocabulary, sessions and levels in every language — the UI asks twice, and it cannot be undone.
+
+---
+
+## Progress and streaks
+
+The dashboard carries a progress strip; tapping it opens the full view:
+
+- **Current streak** and your best ever. A day counts when you finish at least one session, and today being empty does not break a streak that ran through yesterday — it only ends once you miss a full day.
+- **Today** — minutes spoken, sessions, phrases added, phrases mastered.
+- **Last 14 days** as a bar chart of minutes per day.
+- **All time** — minutes, sessions, phrases learning and mastered, days practised, best streak.
+
+Days are counted on your local calendar, so a session at 23:30 belongs to that evening rather than to the next UTC day. Stats are scoped to the active profile and language, matching the rest of the app.
 
 ---
 
@@ -235,7 +290,7 @@ Adapt Naturally sounds like a real conversation. Force Verbatim is better when y
 
 ## Limitations
 
-- Single user. Every row is written against `user_id = 'default_user'`; there is no auth. Languages are separated, users are not.
+- No authentication. Profiles separate people's *data*, but not their *access*: anyone who opens the app can switch to any profile and see it.
 - Your API key sits in the browser. Fine for personal use on your own machine, not for a shared deployment.
 - Duplicate phrases are caught by exact normalized match, so a near-variant of an existing phrase can still be saved as its own row.
 - The Tailwind and Babel CDN builds print production warnings in the console. Harmless here, but this is not a production deployment pattern.
