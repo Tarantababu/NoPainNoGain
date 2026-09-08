@@ -1,0 +1,2831 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
+<meta name="theme-color" content="#111827" />
+<title>Fluent Loop — Voice Language Coach</title>
+
+<script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
+<script src="https://unpkg.com/@babel/standalone@7.26.4/babel.min.js"></script>
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+
+<style>
+  html, body, #root { height: 100%; }
+  body {
+    margin: 0;
+    background: #0b0f19;
+    -webkit-font-smoothing: antialiased;
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    overscroll-behavior-y: none;
+  }
+  ::-webkit-scrollbar { width: 6px; height: 6px; }
+  ::-webkit-scrollbar-thumb { background: #374151; border-radius: 999px; }
+
+  @keyframes recPulse {
+    0%   { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.55); }
+    70%  { box-shadow: 0 0 0 26px rgba(239, 68, 68, 0); }
+    100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0); }
+  }
+  .rec-pulse { animation: recPulse 1.4s cubic-bezier(0.4, 0, 0.6, 1) infinite; }
+
+  @keyframes speakPulse {
+    0%   { box-shadow: 0 0 0 0 rgba(52, 211, 153, 0.45); }
+    70%  { box-shadow: 0 0 0 20px rgba(52, 211, 153, 0); }
+    100% { box-shadow: 0 0 0 0 rgba(52, 211, 153, 0); }
+  }
+  .speak-pulse { animation: speakPulse 1.8s cubic-bezier(0.4, 0, 0.6, 1) infinite; }
+
+  @keyframes sheetUp {
+    from { transform: translateY(100%); }
+    to   { transform: translateY(0); }
+  }
+  .sheet-up { animation: sheetUp 0.32s cubic-bezier(0.16, 1, 0.3, 1); }
+
+  @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+  .fade-in { animation: fadeIn 0.25s ease-out; }
+
+  @keyframes bubbleIn {
+    from { opacity: 0; transform: translateY(8px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+  .bubble-in { animation: bubbleIn 0.22s ease-out; }
+
+  @keyframes eqBar {
+    0%, 100% { transform: scaleY(0.35); }
+    50%      { transform: scaleY(1); }
+  }
+  .eq span {
+    display: inline-block;
+    width: 3px; height: 16px;
+    background: currentColor;
+    border-radius: 2px;
+    margin: 0 1.5px;
+    animation: eqBar 0.9s ease-in-out infinite;
+  }
+  .eq span:nth-child(2) { animation-delay: 0.15s; }
+  .eq span:nth-child(3) { animation-delay: 0.3s; }
+  .eq span:nth-child(4) { animation-delay: 0.45s; }
+
+  .safe-b { padding-bottom: env(safe-area-inset-bottom, 0px); }
+  .no-tap { -webkit-tap-highlight-color: transparent; }
+</style>
+</head>
+<body class="bg-gray-900 text-white">
+<div id="root"></div>
+
+<script type="text/babel" data-presets="react">
+/* ============================================================================
+   FLUENT LOOP — single-file voice language coach
+   ----------------------------------------------------------------------------
+   Required Supabase schema (run this SQL once in the Supabase SQL editor):
+
+   create table if not exists public.profiles (
+     id uuid primary key default gen_random_uuid(),
+     user_id text unique default 'default_user',
+     target_language text default 'German',
+     current_cefr text default 'B1',
+     vocab_injection_mode text default 'adapt_naturally' -- 'adapt_naturally' | 'force_verbatim'
+   );
+
+   create table if not exists public.target_vocabulary (
+     id uuid primary key default gen_random_uuid(),
+     user_id text default 'default_user',
+     phrase text not null,
+     translation text,
+     correction_context text,
+     times_reviewed int default 0,
+     status text default 'learning', -- 'learning' | 'mastered'
+     created_at timestamp with time zone default now()
+   );
+
+   create table if not exists public.conversations (
+     id uuid primary key default gen_random_uuid(),
+     user_id text default 'default_user',
+     topic text not null,
+     duration_seconds int,
+     transcript jsonb not null,
+     feedback jsonb,
+     created_at timestamp with time zone default now()
+   );
+
+   -- This app talks to Supabase directly from the browser with the anon key,
+   -- so either keep RLS off for these tables (single-user/local use) or add
+   -- policies that allow anon read/write:
+   --
+   -- alter table public.profiles enable row level security;
+   -- create policy "anon all" on public.profiles for all to anon using (true) with check (true);
+   -- (repeat for target_vocabulary and conversations)
+   ========================================================================== */
+
+const { useState, useEffect, useRef, useCallback, useMemo } = React;
+
+/* ---------------------------------------------------------------- constants */
+
+const DEFAULT_USER = 'default_user';
+const SESSION_SECONDS = 30 * 60;
+const MASTERY_THRESHOLD = 3;
+const CONFIG_KEY = 'fluentloop.config.v1';
+
+const LANGUAGES = [
+  { name: 'German',   code: 'de' },
+  { name: 'Spanish',  code: 'es' },
+  { name: 'French',   code: 'fr' },
+  { name: 'Italian',  code: 'it' },
+  { name: 'Portuguese', code: 'pt' },
+  { name: 'Dutch',    code: 'nl' },
+  { name: 'Swedish',  code: 'sv' },
+  { name: 'Polish',   code: 'pl' },
+  { name: 'Turkish',  code: 'tr' },
+  { name: 'Russian',  code: 'ru' },
+  { name: 'Arabic',   code: 'ar' },
+  { name: 'Japanese', code: 'ja' },
+  { name: 'Korean',   code: 'ko' },
+  { name: 'Mandarin Chinese', code: 'zh' },
+  { name: 'English',  code: 'en' }
+];
+
+const CEFR_LEVELS = [
+  { code: 'A1', label: 'A1 — Beginner' },
+  { code: 'A2', label: 'A2 — Elementary' },
+  { code: 'B1', label: 'B1 — Intermediate' },
+  { code: 'B2', label: 'B2 — Upper intermediate' },
+  { code: 'C1', label: 'C1 — Advanced' },
+  { code: 'C2', label: 'C2 — Mastery' }
+];
+
+const FALLBACK_TOPICS = [
+  'A weekend trip that did not go as planned',
+  'Ordering food and dealing with a mixed-up order',
+  'Describing your daily routine and what you would change',
+  'A film or series you watched recently',
+  'Talking to a neighbour about noise in the building',
+  'Planning a birthday party with a friend',
+  'A job interview for a role you really want'
+];
+
+const VOICES = ['alloy', 'echo', 'fable', 'onyx', 'nova', 'shimmer'];
+
+const REALTIME_MODEL = 'gpt-realtime';
+const REALTIME_VOICES = ['alloy', 'ash', 'ballad', 'coral', 'echo', 'sage', 'shimmer', 'verse'];
+const MODE_TURN = 'turn_based';
+const MODE_REALTIME = 'realtime';
+
+/* ------------------------------------------------------------------ helpers */
+
+function langCode(name) {
+  const hit = LANGUAGES.find(l => l.name === name);
+  return hit ? hit.code : 'en';
+}
+
+function loadConfig() {
+  try {
+    const raw = localStorage.getItem(CONFIG_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed || !parsed.openaiKey || !parsed.supabaseUrl || !parsed.supabaseKey) return null;
+    return parsed;
+  } catch (e) {
+    return null;
+  }
+}
+
+function saveConfig(cfg) {
+  try {
+    localStorage.setItem(CONFIG_KEY, JSON.stringify(cfg));
+  } catch (e) {
+    console.warn('Could not persist config:', e);
+  }
+}
+
+function formatClock(totalSeconds) {
+  const s = Math.max(0, Math.floor(totalSeconds));
+  const m = Math.floor(s / 60);
+  const r = s % 60;
+  return String(m).padStart(2, '0') + ':' + String(r).padStart(2, '0');
+}
+
+function normalizeText(input) {
+  if (!input) return '';
+  return String(input)
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^\p{L}\p{N}\s]/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+// Fuzzy "did the learner actually use this phrase?" check.
+// Exact normalized substring wins; otherwise require most content words present,
+// which tolerates conjugation and case changes in inflected languages.
+function phraseWasUsed(phrase, haystack) {
+  const p = normalizeText(phrase);
+  const h = normalizeText(haystack);
+  if (!p || !h) return false;
+  if (h.includes(p)) return true;
+
+  const words = p.split(' ').filter(w => w.length > 3);
+  if (words.length < 2) return false;
+
+  const hits = words.filter(w => h.includes(w.slice(0, Math.max(4, w.length - 2)))).length;
+  return hits / words.length >= 0.75;
+}
+
+function pickRecorderMime() {
+  if (typeof MediaRecorder === 'undefined') return '';
+  const candidates = [
+    'audio/webm;codecs=opus',
+    'audio/webm',
+    'audio/ogg;codecs=opus',
+    'audio/mp4',
+    'audio/mpeg'
+  ];
+  for (const c of candidates) {
+    if (MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(c)) return c;
+  }
+  return '';
+}
+
+function extensionForMime(mime) {
+  if (!mime) return 'webm';
+  if (mime.includes('webm')) return 'webm';
+  if (mime.includes('ogg')) return 'ogg';
+  if (mime.includes('mp4')) return 'mp4';
+  if (mime.includes('mpeg')) return 'mp3';
+  if (mime.includes('wav')) return 'wav';
+  return 'webm';
+}
+
+/* -------------------------------------------------------------- OpenAI calls */
+
+async function openaiError(res) {
+  let detail = '';
+  try {
+    const body = await res.json();
+    detail = (body && body.error && body.error.message) ? body.error.message : JSON.stringify(body);
+  } catch (e) {
+    try { detail = await res.text(); } catch (e2) { detail = ''; }
+  }
+  return new Error('OpenAI ' + res.status + ': ' + (detail || res.statusText));
+}
+
+async function transcribeAudio(apiKey, blob, language) {
+  const ext = extensionForMime(blob.type);
+  const form = new FormData();
+  form.append('file', blob, 'speech.' + ext);
+  form.append('model', 'whisper-1');
+  form.append('language', langCode(language));
+  form.append('temperature', '0');
+
+  const res = await fetch('https://api.openai.com/v1/audio/transcriptions', {
+    method: 'POST',
+    headers: { 'Authorization': 'Bearer ' + apiKey },
+    body: form
+  });
+  if (!res.ok) throw await openaiError(res);
+  const data = await res.json();
+  return (data.text || '').trim();
+}
+
+async function chatCompletion(apiKey, messages, options) {
+  const opts = options || {};
+  const payload = {
+    model: 'gpt-4o',
+    messages: messages,
+    temperature: typeof opts.temperature === 'number' ? opts.temperature : 0.8
+  };
+  if (opts.maxTokens) payload.max_tokens = opts.maxTokens;
+  if (opts.json) payload.response_format = { type: 'json_object' };
+
+  const res = await fetch('https://api.openai.com/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      'Authorization': 'Bearer ' + apiKey,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify(payload)
+  });
+  if (!res.ok) throw await openaiError(res);
+  const data = await res.json();
+  const choice = data.choices && data.choices[0];
+  return (choice && choice.message && choice.message.content ? choice.message.content : '').trim();
+}
+
+async function synthesizeSpeech(apiKey, text, voice) {
+  const res = await fetch('https://api.openai.com/v1/audio/speech', {
+    method: 'POST',
+    headers: {
+      'Authorization': 'Bearer ' + apiKey,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({
+      model: 'tts-1',
+      voice: voice || 'alloy',
+      input: text,
+      response_format: 'mp3'
+    })
+  });
+  if (!res.ok) throw await openaiError(res);
+  return await res.blob();
+}
+
+async function verifyOpenAIKey(apiKey) {
+  const res = await fetch('https://api.openai.com/v1/models', {
+    headers: { 'Authorization': 'Bearer ' + apiKey }
+  });
+  if (!res.ok) throw await openaiError(res);
+  return true;
+}
+
+/* --------------------------------------------------------- realtime engine */
+
+// Realtime runs over WebRTC: the browser sends the mic track straight to OpenAI
+// and plays the model's audio back through an <audio> element, so there is no
+// record -> upload -> synthesize round trip. Turn taking is done server side by
+// voice activity detection, which also handles barge-in.
+function buildRealtimeSession(profile, topic, vocab, voice) {
+  const base = buildSystemPrompt(profile, topic, vocab);
+  const realtimeRules = [
+    '',
+    'THIS IS A LIVE SPOKEN CALL:',
+    '- Speak at a natural, unhurried pace for a CEFR ' + profile.current_cefr + ' listener.',
+    '- Keep every turn to one or two sentences, then stop and let the learner speak.',
+    '- Never talk over the learner. If they start speaking, stop immediately and listen.',
+    '- Tolerate pauses. If the learner goes quiet for a while, ask a simpler version of your question.',
+    '- If you cannot make out what they said, ask them to repeat it in ' + profile.target_language + '.'
+  ].join('\n');
+
+  return {
+    type: 'realtime',
+    model: REALTIME_MODEL,
+    instructions: base + '\n' + realtimeRules,
+    output_modalities: ['audio'],
+    audio: {
+      input: {
+        transcription: { model: 'whisper-1', language: langCode(profile.target_language) },
+        noise_reduction: { type: 'near_field' },
+        turn_detection: {
+          type: 'server_vad',
+          threshold: 0.5,
+          prefix_padding_ms: 300,
+          silence_duration_ms: 700,
+          create_response: true,
+          interrupt_response: true
+        }
+      },
+      output: {
+        voice: REALTIME_VOICES.indexOf(voice) === -1 ? 'alloy' : voice
+      }
+    }
+  };
+}
+
+// Ephemeral client secrets are the documented way to authenticate a browser.
+// If the endpoint is unavailable we fall back to the API key that is already in
+// this browser anyway, so the feature still works on older accounts.
+async function createRealtimeSecret(apiKey, sessionConfig) {
+  const res = await fetch('https://api.openai.com/v1/realtime/client_secrets', {
+    method: 'POST',
+    headers: {
+      'Authorization': 'Bearer ' + apiKey,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({
+      expires_after: { anchor: 'created_at', seconds: 600 },
+      session: sessionConfig
+    })
+  });
+  if (!res.ok) throw await openaiError(res);
+  const data = await res.json();
+  if (data.value) return data.value;
+  if (data.client_secret && data.client_secret.value) return data.client_secret.value;
+  return '';
+}
+
+async function connectRealtime(apiKey, sessionConfig, handlers) {
+  let secret = '';
+  let usedRawKey = false;
+  try {
+    secret = await createRealtimeSecret(apiKey, sessionConfig);
+  } catch (err) {
+    console.warn('Ephemeral client secret unavailable, falling back to the API key:', err);
+  }
+  if (!secret) {
+    secret = apiKey;
+    usedRawKey = true;
+  }
+
+  const pc = new RTCPeerConnection();
+  const audioEl = document.createElement('audio');
+  audioEl.autoplay = true;
+  audioEl.setAttribute('playsinline', '');
+  audioEl.style.display = 'none';
+  document.body.appendChild(audioEl);
+
+  let micStream = null;
+
+  function teardown() {
+    try { if (micStream) micStream.getTracks().forEach(t => t.stop()); } catch (e) { /* noop */ }
+    try { pc.close(); } catch (e) { /* noop */ }
+    try {
+      audioEl.srcObject = null;
+      if (audioEl.parentNode) audioEl.parentNode.removeChild(audioEl);
+    } catch (e) { /* noop */ }
+  }
+
+  try {
+    pc.ontrack = (e) => { audioEl.srcObject = e.streams[0]; };
+
+    micStream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+    });
+    micStream.getTracks().forEach(t => pc.addTrack(t, micStream));
+
+    const dc = pc.createDataChannel('oai-events');
+    dc.addEventListener('open', () => handlers.onOpen(dc));
+    dc.addEventListener('message', (e) => {
+      let parsed = null;
+      try { parsed = JSON.parse(e.data); } catch (err) { return; }
+      handlers.onEvent(parsed);
+    });
+
+    pc.addEventListener('connectionstatechange', () => handlers.onConnectionState(pc.connectionState));
+
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+
+    const url = 'https://api.openai.com/v1/realtime/calls' +
+      (usedRawKey ? '?model=' + encodeURIComponent(sessionConfig.model) : '');
+
+    const res = await fetch(url, {
+      method: 'POST',
+      body: offer.sdp,
+      headers: {
+        'Authorization': 'Bearer ' + secret,
+        'Content-Type': 'application/sdp'
+      }
+    });
+    if (!res.ok) throw await openaiError(res);
+
+    const answerSdp = await res.text();
+    await pc.setRemoteDescription({ type: 'answer', sdp: answerSdp });
+
+    return {
+      pc: pc,
+      micStream: micStream,
+      audioEl: audioEl,
+      close: teardown
+    };
+  } catch (err) {
+    teardown();
+    throw err;
+  }
+}
+
+/* ------------------------------------------------------- phrase suggestions */
+
+// The analysis engine only ever proposes phrases reactively, from mistakes the
+// learner already made. This fills the other half: high-frequency chunks worth
+// starting to use, generated for the level rather than for a past session.
+async function suggestStarterPhrases(apiKey, profile, theme, existingPhrases) {
+  const avoid = (existingPhrases || []).slice(0, 120);
+  const avoidBlock = avoid.length
+    ? 'The learner already has these phrases, so do NOT suggest them or close variants:\n' +
+      avoid.map(p => '- ' + p).join('\n')
+    : 'The learner has no saved phrases yet, so cover the essentials first.';
+
+  const themeLine = theme && theme.trim()
+    ? 'Focus the whole set on this theme or situation: ' + theme.trim() + '.'
+    : 'Cover a spread of everyday situations rather than one narrow theme.';
+
+  const raw = await chatCompletion(apiKey, [
+    {
+      role: 'system',
+      content: 'You are an experienced ' + profile.target_language + ' teacher who builds vocabulary lists from ' +
+        'corpus frequency and real spoken usage. You always reply with a single valid JSON object and nothing else.'
+    },
+    {
+      role: 'user',
+      content: [
+        'Propose 10 ' + profile.target_language + ' phrases a CEFR ' + profile.current_cefr +
+          ' learner should start actively using in conversation.',
+        '',
+        themeLine,
+        '',
+        avoidBlock,
+        '',
+        'What to propose:',
+        '- Multi-word chunks only: collocations, fixed expressions, sentence starters, connectors, ' +
+          'hedges, reactions and polite formulas. Never isolated single words.',
+        '- Things a native actually says often, not textbook curiosities.',
+        '- Pitched at CEFR ' + profile.current_cefr + ': comfortably sayable at that level but a step above ' +
+          'what the learner probably reaches for by default.',
+        '- Give each phrase in its natural citation form, the form the learner should memorise.',
+        '',
+        'Return ONLY a JSON object of this exact shape:',
+        '{',
+        '  "phrases": [',
+        '    { "phrase": "string", "translation": "string", "context": "string", "category": "string" }',
+        '  ]',
+        '}',
+        '',
+        'Field rules:',
+        '- "phrase" is in ' + profile.target_language + '.',
+        '- "translation" is a short, natural English equivalent.',
+        '- "context" is one short English sentence saying when to reach for it.',
+        '- "category" is one or two words, such as "opinion", "connector", "small talk", "polite request", "reaction".',
+        '- Output raw JSON only, with no markdown fences and no commentary.'
+      ].join('\n')
+    }
+  ], { json: true, temperature: 0.7, maxTokens: 1600 });
+
+  const cleaned = raw.replace(/^```(?:json)?/i, '').replace(/```$/, '').trim();
+  const parsed = JSON.parse(cleaned);
+  const rows = Array.isArray(parsed.phrases) ? parsed.phrases : [];
+
+  const seen = new Set((existingPhrases || []).map(normalizeText));
+  const out = [];
+  rows.forEach(r => {
+    if (!r || !r.phrase) return;
+    const phrase = String(r.phrase).trim();
+    const key = normalizeText(phrase);
+    if (!key || seen.has(key)) return;
+    seen.add(key);
+    out.push({
+      phrase: phrase,
+      translation: r.translation ? String(r.translation).trim() : '',
+      context: r.context ? String(r.context).trim() : '',
+      category: r.category ? String(r.category).trim() : '',
+      source: 'suggested'
+    });
+  });
+  return out;
+}
+
+/* ----------------------------------------------------------- export helpers */
+
+// The schema has no Turkish column, so Turkish is produced on demand at export
+// time and cached in memory for the rest of the session.
+async function translateToTurkish(apiKey, items, sourceLanguage) {
+  if (!items.length) return [];
+
+  const list = items.map((it, i) => {
+    const en = it.translation ? '  [known English meaning: ' + it.translation + ']' : '';
+    return (i + 1) + '. ' + it.phrase + en;
+  }).join('\n');
+
+  const raw = await chatCompletion(apiKey, [
+    {
+      role: 'system',
+      content: 'You are a professional ' + sourceLanguage + '-to-Turkish translator. ' +
+        'You always reply with a single valid JSON object and nothing else.'
+    },
+    {
+      role: 'user',
+      content: [
+        'Translate each of the following ' + sourceLanguage + ' phrases into natural Turkish.',
+        '',
+        list,
+        '',
+        'Return ONLY a JSON object of this exact shape:',
+        '{ "translations": [ { "index": 1, "turkish": "string" } ] }',
+        '',
+        'Rules:',
+        '- Include one entry for EVERY index from 1 to ' + items.length + ', in order.',
+        '- "turkish" is the Turkish rendering a native speaker would actually say, not a word-for-word gloss.',
+        '- For idioms and fixed expressions, give the equivalent Turkish idiom rather than a literal translation.',
+        '- Keep each translation as short as the original. No explanations, no notes, no alternatives in brackets.',
+        '- Output raw JSON only, with no markdown fences and no commentary.'
+      ].join('\n')
+    }
+  ], { json: true, temperature: 0.2, maxTokens: 2000 });
+
+  const cleaned = raw.replace(/^```(?:json)?/i, '').replace(/```$/, '').trim();
+  const parsed = JSON.parse(cleaned);
+  const rows = Array.isArray(parsed.translations) ? parsed.translations : [];
+
+  const byIndex = new Map();
+  rows.forEach(r => {
+    const n = Number(r && r.index);
+    if (Number.isInteger(n) && n >= 1 && n <= items.length) {
+      byIndex.set(n, String(r.turkish == null ? '' : r.turkish).trim());
+    }
+  });
+
+  return items.map((it, i) => byIndex.get(i + 1) || '');
+}
+
+function csvCell(value) {
+  const text = value == null ? '' : String(value);
+  return '"' + text.replace(/"/g, '""') + '"';
+}
+
+function buildVocabCsv(rows, sourceLanguage, withTurkish) {
+  const header = [sourceLanguage + ' phrase', 'English', 'Turkish', 'Context', 'Times reviewed', 'Target reviews', 'Status', 'Added']
+    .filter((h, i) => withTurkish || i !== 2);
+
+  const lines = [header.map(csvCell).join(',')];
+
+  rows.forEach(r => {
+    const cells = [
+      r.phrase,
+      r.translation || '',
+      r.turkish || '',
+      r.correction_context || '',
+      r.times_reviewed || 0,
+      MASTERY_THRESHOLD,
+      r.status || 'learning',
+      r.created_at ? String(r.created_at).slice(0, 10) : ''
+    ].filter((c, i) => withTurkish || i !== 2);
+    lines.push(cells.map(csvCell).join(','));
+  });
+
+  // The BOM keeps Turkish and German characters intact when Excel opens the file.
+  return '﻿' + lines.join('\r\n') + '\r\n';
+}
+
+function buildVocabText(rows, sourceLanguage, withTurkish) {
+  const stamp = new Date().toISOString().slice(0, 10);
+  const title = 'Active vocabulary — ' + sourceLanguage + (withTurkish ? ' → Turkish' : '');
+  const out = [
+    title,
+    'Exported ' + stamp + ' · ' + rows.length + ' phrase' + (rows.length === 1 ? '' : 's'),
+    '='.repeat(Math.max(title.length, 32)),
+    ''
+  ];
+
+  rows.forEach((r, i) => {
+    out.push((i + 1) + '. ' + r.phrase);
+    if (withTurkish) out.push('   TR: ' + (r.turkish || '—'));
+    if (r.translation) out.push('   EN: ' + r.translation);
+    if (r.correction_context) out.push('   Context: ' + r.correction_context);
+    out.push('   Progress: ' + (r.times_reviewed || 0) + '/' + MASTERY_THRESHOLD + ' uses · ' + (r.status || 'learning'));
+    out.push('');
+  });
+
+  return out.join('\n');
+}
+
+function downloadFile(filename, mimeType, content) {
+  const blob = new Blob([content], { type: mimeType + ';charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  a.rel = 'noopener';
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 4000);
+}
+
+/* ------------------------------------------------------------ prompt builders */
+
+function buildSystemPrompt(profile, topic, vocab) {
+  const lang = profile.target_language;
+  const level = profile.current_cefr;
+  const forceVerbatim = profile.vocab_injection_mode === 'force_verbatim';
+
+  const vocabLines = vocab.map(v => {
+    const tr = v.translation ? ' — means: ' + v.translation : '';
+    const ctx = v.correction_context ? ' — context: ' + v.correction_context : '';
+    return '- "' + v.phrase + '"' + tr + ctx;
+  }).join('\n');
+
+  const injectionRule = forceVerbatim
+    ? 'FORCE VERBATIM MODE: you must use each target phrase EXACTLY as written, character for character, ' +
+      'with no change to word order, conjugation, article, or case. Build your sentences around the phrase so ' +
+      'the verbatim form still fits. Use at most one target phrase per turn, and prefer phrases you have not used yet.'
+    : 'ADAPT NATURALLY MODE: weave the target phrases into your turns so they sound native. You may conjugate, ' +
+      'decline, change tense, adjust articles and word order so the phrase fits the sentence. Use at most one ' +
+      'target phrase per turn, and prefer phrases you have not used yet.';
+
+  const vocabBlock = vocab.length
+    ? 'ACTIVE TARGET PHRASES the learner is trying to acquire:\n' + vocabLines + '\n\n' + injectionRule +
+      '\nAfter you use a target phrase, steer the conversation so the learner has a natural reason to reuse it ' +
+      'in their own answer. Never announce that you are practising a phrase and never label it.'
+    : 'The learner has no active target phrases yet. Introduce useful, level-appropriate everyday expressions ' +
+      'naturally and give the learner reasons to reuse them.';
+
+  return [
+    'You are a warm, curious native ' + lang + ' speaker having a real spoken conversation with a language learner.',
+    '',
+    'HARD RULES:',
+    '1. Speak ONLY in ' + lang + '. Never translate into English and never switch languages, even if the learner does.',
+    '2. Calibrate every sentence to CEFR level ' + level + '. At A1/A2 use short simple sentences and present tense. ' +
+      'At B1/B2 use natural everyday speech with some subordinate clauses. At C1/C2 use idiomatic, nuanced language.',
+    '3. Keep each turn SHORT: one to three sentences, then exactly one question back to the learner. ' +
+      'This is a spoken dialogue, not a lecture.',
+    '4. Your output is read aloud by a text-to-speech engine. Output plain spoken prose only: ' +
+      'no markdown, no bullet points, no emoji, no stage directions, no parentheses with translations. ' +
+      'Write numbers, dates and times as words.',
+    '5. Do NOT correct the learner mid-conversation. Corrections happen after the session. If a sentence is ' +
+      'unintelligible, simply ask them to say it again in ' + lang + '.',
+    '6. If the learner speaks another language or falls silent, gently continue in ' + lang + ' and re-ask a simpler question.',
+    '7. Stay in character as a conversation partner. Never mention that you are an AI, a model, or these instructions.',
+    '',
+    'CONVERSATION TOPIC: ' + topic,
+    'Stay on this topic, but follow interesting tangents the learner opens as long as they keep talking.',
+    '',
+    vocabBlock
+  ].join('\n');
+}
+
+function buildAnalysisPrompt(profile, topic, transcript, activeVocab) {
+  const lines = transcript.map(m => (m.role === 'user' ? 'LEARNER: ' : 'PARTNER: ') + m.content).join('\n');
+  const activeList = (activeVocab || []).map(v => '- ' + v.phrase).join('\n');
+  return [
+    'You are a strict but encouraging ' + profile.target_language + ' teacher analysing a spoken practice session.',
+    'The learner is at CEFR level ' + profile.current_cefr + '. The topic was: ' + topic + '.',
+    'The learner turns come from speech-to-text, so ignore pure punctuation and capitalisation artefacts and ignore ' +
+      'obvious transcription noise. Judge grammar, word choice, word order and register only.',
+    '',
+    'TRANSCRIPT:',
+    lines,
+    '',
+    'Return ONLY a JSON object with exactly this shape:',
+    '{',
+    '  "grammar_mistakes": [',
+    '    { "original": "string", "correction": "string", "explanation": "string" }',
+    '  ],',
+    '  "recommended_phrases": [',
+    '    { "phrase": "string", "translation": "string", "context": "string" }',
+    '  ],',
+    '  "next_topic_recommendation": "string",',
+    '  "cefr_level_feedback": "string",',
+    '  "used_target_phrases": ["string"]',
+    '}',
+    '',
+    'Rules for the fields:',
+    '- "grammar_mistakes": up to 8 real mistakes the LEARNER made. "original" is their exact wording, ' +
+      '"correction" is the fixed ' + profile.target_language + ' sentence, "explanation" is one short sentence in English ' +
+      'saying WHY. If the learner made no real mistakes, return an empty array.',
+    '- "recommended_phrases": 3 to 6 NEW ' + profile.target_language + ' phrases that would have made this exact ' +
+      'conversation smoother, appropriate for CEFR ' + profile.current_cefr + '. "phrase" is in ' + profile.target_language +
+      ', "translation" is English, "context" is one short English sentence on when to use it.',
+    '- "next_topic_recommendation": one concrete conversation topic for the next session that will force the learner ' +
+      'to reuse those phrases and re-attempt the structures they got wrong. One sentence, in English.',
+    '- "cefr_level_feedback": two to four sentences in English on their current level, what went well, and the single ' +
+      'highest-value thing to fix next.',
+    activeList
+      ? '- "used_target_phrases": the learner is currently practising these target phrases:\n' + activeList + '\n' +
+        '"used_target_phrases" must list, copied EXACTLY as written above, only those target phrases the LEARNER ' +
+        'actually produced in their own turns. Count a phrase as used even if they conjugated it, declined it, ' +
+        'split it, changed its tense, or made a small error in it. Do not count phrases only the PARTNER said. ' +
+        'Do not invent phrases that are not in the list. If none were used, return an empty array.'
+      : '- "used_target_phrases": return an empty array, the learner has no active target phrases.',
+    'Output raw JSON only, with no markdown fences and no commentary.'
+  ].join('\n');
+}
+
+/* ------------------------------------------------------------------- UI bits */
+
+function Spinner({ className }) {
+  return (
+    <svg className={'animate-spin ' + (className || 'h-5 w-5')} viewBox="0 0 24 24" fill="none">
+      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+      <path className="opacity-75" fill="currentColor"
+        d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+    </svg>
+  );
+}
+
+function MicIcon({ className }) {
+  return (
+    <svg className={className || 'h-10 w-10'} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8"
+      strokeLinecap="round" strokeLinejoin="round">
+      <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z" />
+      <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
+      <line x1="12" y1="19" x2="12" y2="22" />
+    </svg>
+  );
+}
+
+function MicOffIcon({ className }) {
+  return (
+    <svg className={className || 'h-10 w-10'} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8"
+      strokeLinecap="round" strokeLinejoin="round">
+      <line x1="2" y1="2" x2="22" y2="22" />
+      <path d="M9 9v3a3 3 0 0 0 5.12 2.12M15 9.34V5a3 3 0 0 0-5.94-.6" />
+      <path d="M17 16.95A7 7 0 0 1 5 12v-2M19 10v2a7 7 0 0 1-.11 1.23" />
+      <line x1="12" y1="19" x2="12" y2="22" />
+    </svg>
+  );
+}
+
+function StopIcon({ className }) {
+  return (
+    <svg className={className || 'h-9 w-9'} viewBox="0 0 24 24" fill="currentColor">
+      <rect x="6" y="6" width="12" height="12" rx="2.5" />
+    </svg>
+  );
+}
+
+function Toast({ toast, onDismiss }) {
+  useEffect(() => {
+    if (!toast) return undefined;
+    const t = setTimeout(onDismiss, toast.type === 'error' ? 7000 : 3500);
+    return () => clearTimeout(t);
+  }, [toast, onDismiss]);
+
+  if (!toast) return null;
+  const tone = toast.type === 'error'
+    ? 'bg-red-500/15 border-red-500/40 text-red-200'
+    : toast.type === 'success'
+      ? 'bg-emerald-500/15 border-emerald-500/40 text-emerald-200'
+      : 'bg-gray-700/60 border-gray-600 text-gray-100';
+
+  return (
+    <div className="fixed inset-x-0 top-0 z-50 flex justify-center px-4 pt-4 pointer-events-none">
+      <div className={'fade-in pointer-events-auto w-full max-w-md rounded-xl border px-4 py-3 text-sm shadow-lg backdrop-blur ' + tone}
+        onClick={onDismiss}>
+        {toast.message}
+      </div>
+    </div>
+  );
+}
+
+function Field({ label, hint, children }) {
+  return (
+    <label className="block">
+      <span className="mb-1.5 block text-xs font-medium uppercase tracking-wider text-gray-400">{label}</span>
+      {children}
+      {hint ? <span className="mt-1.5 block text-xs text-gray-500">{hint}</span> : null}
+    </label>
+  );
+}
+
+const inputClass =
+  'w-full rounded-xl border border-gray-700 bg-gray-800 px-3.5 py-3 text-sm text-white placeholder-gray-500 ' +
+  'outline-none transition focus:border-indigo-500 focus:ring-2 focus:ring-indigo-500/30';
+
+/* -------------------------------------------------------------- setup screen */
+
+function SetupScreen({ initial, onSaved, onCancel, pushToast }) {
+  const [openaiKey, setOpenaiKey] = useState(initial ? initial.openaiKey : '');
+  const [supabaseUrl, setSupabaseUrl] = useState(initial ? initial.supabaseUrl : '');
+  const [supabaseKey, setSupabaseKey] = useState(initial ? initial.supabaseKey : '');
+  const [language, setLanguage] = useState(initial ? initial.target_language : 'German');
+  const [cefr, setCefr] = useState(initial ? initial.current_cefr : 'B1');
+  const [mode, setMode] = useState(initial ? initial.vocab_injection_mode : 'adapt_naturally');
+  const [voice, setVoice] = useState(initial && initial.voice ? initial.voice : 'alloy');
+  const [busy, setBusy] = useState(false);
+  const [step, setStep] = useState('');
+
+  async function handleSave(e) {
+    e.preventDefault();
+    const key = openaiKey.trim();
+    const url = supabaseUrl.trim().replace(/\/+$/, '');
+    const anon = supabaseKey.trim();
+
+    if (!key || !url || !anon) {
+      pushToast('error', 'OpenAI key, Supabase URL and Supabase anon key are all required.');
+      return;
+    }
+    if (!/^https?:\/\//i.test(url)) {
+      pushToast('error', 'Supabase URL must start with https://');
+      return;
+    }
+
+    setBusy(true);
+    try {
+      setStep('Verifying OpenAI key…');
+      await verifyOpenAIKey(key);
+
+      setStep('Connecting to Supabase…');
+      const client = window.supabase.createClient(url, anon);
+
+      const probe = await client.from('profiles').select('id').limit(1);
+      if (probe.error) {
+        throw new Error('Supabase: ' + probe.error.message + ' (check the URL, the anon key, that the tables exist, and that RLS allows anon access)');
+      }
+
+      setStep('Saving your profile…');
+      const existing = await client
+        .from('profiles')
+        .select('*')
+        .eq('user_id', DEFAULT_USER)
+        .maybeSingle();
+      if (existing.error) throw new Error('Supabase: ' + existing.error.message);
+
+      const profileRow = {
+        user_id: DEFAULT_USER,
+        target_language: language,
+        current_cefr: cefr,
+        vocab_injection_mode: mode
+      };
+
+      let saved;
+      if (existing.data) {
+        const upd = await client
+          .from('profiles')
+          .update(profileRow)
+          .eq('user_id', DEFAULT_USER)
+          .select()
+          .single();
+        if (upd.error) throw new Error('Supabase: ' + upd.error.message);
+        saved = upd.data;
+      } else {
+        const ins = await client
+          .from('profiles')
+          .insert(profileRow)
+          .select()
+          .single();
+        if (ins.error) throw new Error('Supabase: ' + ins.error.message);
+        saved = ins.data;
+      }
+
+      const cfg = { openaiKey: key, supabaseUrl: url, supabaseKey: anon, voice: voice };
+      saveConfig(cfg);
+      pushToast('success', 'Connected. Everything checks out.');
+      onSaved(cfg, client, saved);
+    } catch (err) {
+      console.error(err);
+      pushToast('error', err.message || String(err));
+    } finally {
+      setBusy(false);
+      setStep('');
+    }
+  }
+
+  return (
+    <div className="mx-auto flex min-h-full w-full max-w-md flex-col px-5 pb-10 pt-10">
+      <div className="mb-8">
+        <div className="mb-3 inline-flex h-12 w-12 items-center justify-center rounded-2xl bg-indigo-500/15 text-indigo-400">
+          <MicIcon className="h-6 w-6" />
+        </div>
+        <h1 className="text-2xl font-semibold tracking-tight">Fluent Loop</h1>
+        <p className="mt-1 text-sm text-gray-400">
+          Talk out loud every day. Your mistakes become tomorrow's vocabulary.
+        </p>
+      </div>
+
+      <form onSubmit={handleSave} className="space-y-5">
+        <div className="space-y-4 rounded-2xl border border-gray-800 bg-gray-800/40 p-4">
+          <h2 className="text-sm font-semibold text-gray-200">Credentials</h2>
+          <Field label="OpenAI API Key" hint="Used for Whisper, GPT-4o and TTS. Stored only in this browser.">
+            <input className={inputClass} type="password" autoComplete="off" spellCheck="false"
+              placeholder="sk-…" value={openaiKey} onChange={e => setOpenaiKey(e.target.value)} />
+          </Field>
+          <Field label="Supabase URL">
+            <input className={inputClass} type="url" autoComplete="off" spellCheck="false"
+              placeholder="https://xxxx.supabase.co" value={supabaseUrl} onChange={e => setSupabaseUrl(e.target.value)} />
+          </Field>
+          <Field label="Supabase Anon Key">
+            <input className={inputClass} type="password" autoComplete="off" spellCheck="false"
+              placeholder="eyJhbGciOi…" value={supabaseKey} onChange={e => setSupabaseKey(e.target.value)} />
+          </Field>
+        </div>
+
+        <div className="space-y-4 rounded-2xl border border-gray-800 bg-gray-800/40 p-4">
+          <h2 className="text-sm font-semibold text-gray-200">Learning profile</h2>
+          <Field label="Target Language">
+            <select className={inputClass} value={language} onChange={e => setLanguage(e.target.value)}>
+              {LANGUAGES.map(l => <option key={l.code} value={l.name}>{l.name}</option>)}
+            </select>
+          </Field>
+          <Field label="CEFR Level">
+            <select className={inputClass} value={cefr} onChange={e => setCefr(e.target.value)}>
+              {CEFR_LEVELS.map(l => <option key={l.code} value={l.code}>{l.label}</option>)}
+            </select>
+          </Field>
+          <Field label="Partner Voice">
+            <select className={inputClass} value={voice} onChange={e => setVoice(e.target.value)}>
+              {VOICES.map(v => <option key={v} value={v}>{v}</option>)}
+            </select>
+          </Field>
+
+          <div>
+            <span className="mb-1.5 block text-xs font-medium uppercase tracking-wider text-gray-400">
+              Vocab Injection Mode
+            </span>
+            <div className="grid grid-cols-2 gap-2">
+              <button type="button" onClick={() => setMode('adapt_naturally')}
+                className={'no-tap rounded-xl border p-3 text-left transition ' + (mode === 'adapt_naturally'
+                  ? 'border-indigo-500 bg-indigo-500/15'
+                  : 'border-gray-700 bg-gray-800 hover:border-gray-600')}>
+                <div className="text-sm font-medium">Adapt Naturally</div>
+                <div className="mt-0.5 text-xs text-gray-400">Phrases get conjugated to fit the sentence.</div>
+              </button>
+              <button type="button" onClick={() => setMode('force_verbatim')}
+                className={'no-tap rounded-xl border p-3 text-left transition ' + (mode === 'force_verbatim'
+                  ? 'border-indigo-500 bg-indigo-500/15'
+                  : 'border-gray-700 bg-gray-800 hover:border-gray-600')}>
+                <div className="text-sm font-medium">Force Verbatim</div>
+                <div className="mt-0.5 text-xs text-gray-400">Phrases appear exactly as saved.</div>
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <button type="submit" disabled={busy}
+          className="no-tap flex w-full items-center justify-center gap-2 rounded-xl bg-indigo-600 px-4 py-3.5 text-sm font-semibold text-white transition hover:bg-indigo-500 disabled:opacity-50">
+          {busy ? <Spinner className="h-4 w-4" /> : null}
+          {busy ? (step || 'Testing…') : 'Test & Save'}
+        </button>
+
+        {onCancel ? (
+          <button type="button" onClick={onCancel}
+            className="no-tap w-full rounded-xl px-4 py-3 text-sm text-gray-400 transition hover:text-white">
+            Cancel
+          </button>
+        ) : null}
+      </form>
+
+      <details className="mt-8 rounded-2xl border border-gray-800 bg-gray-800/30 p-4">
+        <summary className="cursor-pointer text-sm font-medium text-gray-300">First time? Run this SQL in Supabase</summary>
+        <pre className="mt-3 overflow-x-auto rounded-lg bg-gray-900 p-3 text-[11px] leading-relaxed text-gray-400">{SQL_SNIPPET}</pre>
+      </details>
+    </div>
+  );
+}
+
+const SQL_SNIPPET = `create table if not exists public.profiles (
+  id uuid primary key default gen_random_uuid(),
+  user_id text unique default 'default_user',
+  target_language text default 'German',
+  current_cefr text default 'B1',
+  vocab_injection_mode text default 'adapt_naturally'
+);
+
+create table if not exists public.target_vocabulary (
+  id uuid primary key default gen_random_uuid(),
+  user_id text default 'default_user',
+  phrase text not null,
+  translation text,
+  correction_context text,
+  times_reviewed int default 0,
+  status text default 'learning',
+  created_at timestamptz default now()
+);
+
+create table if not exists public.conversations (
+  id uuid primary key default gen_random_uuid(),
+  user_id text default 'default_user',
+  topic text not null,
+  duration_seconds int,
+  transcript jsonb not null,
+  feedback jsonb,
+  created_at timestamptz default now()
+);`;
+
+/* ---------------------------------------------------------------- dashboard */
+
+function VocabBar({ vocab, loading, onSuggest }) {
+  if (loading) {
+    return (
+      <div className="flex gap-2 overflow-hidden">
+        {[0, 1, 2].map(i => (
+          <div key={i} className="h-[68px] w-40 shrink-0 animate-pulse rounded-xl bg-gray-800" />
+        ))}
+      </div>
+    );
+  }
+
+  if (!vocab.length) {
+    return (
+      <div className="rounded-xl border border-dashed border-gray-700 bg-gray-800/30 p-4">
+        <p className="text-sm text-gray-400">
+          No active phrases yet. Sessions stock this list from your mistakes — or start with a set worth using.
+        </p>
+        <button onClick={onSuggest}
+          className="no-tap mt-3 rounded-lg bg-indigo-600 px-3 py-2 text-xs font-semibold text-white transition hover:bg-indigo-500">
+          Suggest starter phrases
+        </button>
+      </div>
+    );
+  }
+
+  return (
+    <div className="-mx-5 flex gap-2.5 overflow-x-auto px-5 pb-1">
+      {vocab.map(v => {
+        const used = Math.min(v.times_reviewed || 0, MASTERY_THRESHOLD);
+        const pct = (used / MASTERY_THRESHOLD) * 100;
+        return (
+          <div key={v.id} className="w-44 shrink-0 rounded-xl border border-gray-700/70 bg-gray-800 p-3">
+            <div className="truncate text-sm font-medium text-white" title={v.phrase}>{v.phrase}</div>
+            <div className="mt-0.5 h-4 truncate text-xs text-gray-400" title={v.translation || ''}>
+              {v.translation || ''}
+            </div>
+            <div className="mt-2.5 h-1.5 w-full overflow-hidden rounded-full bg-gray-700">
+              <div className="h-full rounded-full bg-indigo-500 transition-all" style={{ width: pct + '%' }} />
+            </div>
+            <div className="mt-1.5 text-[11px] font-medium text-gray-500">{used}/{MASTERY_THRESHOLD} uses</div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function SuggestSheet({
+  targetLanguage, cefr, items, busy, note, onGenerate, onAdd, onToggle, onAddManual, onClose
+}) {
+  const [theme, setTheme] = useState('');
+  const [manualPhrase, setManualPhrase] = useState('');
+  const [manualTranslation, setManualTranslation] = useState('');
+
+  const selected = items.filter(it => it.selected);
+
+  function submitManual(e) {
+    e.preventDefault();
+    const phrase = manualPhrase.trim();
+    if (!phrase) return;
+    onAddManual(phrase, manualTranslation.trim());
+    setManualPhrase('');
+    setManualTranslation('');
+  }
+
+  return (
+    <div className="fixed inset-0 z-40 flex flex-col justify-end">
+      <div className="fade-in absolute inset-0 bg-black/60 backdrop-blur-sm" onClick={busy ? undefined : onClose} />
+      <div className="sheet-up relative flex max-h-[90vh] flex-col rounded-t-3xl border-t border-gray-700 bg-gray-900 shadow-2xl">
+        <div className="mx-auto mt-3 h-1.5 w-10 shrink-0 rounded-full bg-gray-700" />
+
+        <div className="mx-auto w-full max-w-md px-5 pt-4">
+          <div className="flex items-center justify-between">
+            <h2 className="text-lg font-semibold tracking-tight">Add phrases</h2>
+            <button onClick={onClose} disabled={busy}
+              className="no-tap rounded-lg p-1.5 text-gray-400 transition hover:text-white disabled:opacity-40" aria-label="Close">
+              <svg className="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+                <path d="M18 6 6 18M6 6l12 12" />
+              </svg>
+            </button>
+          </div>
+          <p className="mt-1 text-sm text-gray-400">
+            Worth-using {targetLanguage} chunks for CEFR {cefr} — not just fixes for past mistakes.
+          </p>
+
+          <div className="mt-4 flex gap-2">
+            <input className={inputClass + ' flex-1'} type="text" value={theme} disabled={busy}
+              onChange={e => setTheme(e.target.value)}
+              placeholder="Theme (optional) — e.g. small talk at work" />
+            <button onClick={() => onGenerate(theme)} disabled={busy}
+              className="no-tap shrink-0 rounded-xl bg-indigo-600 px-4 text-sm font-semibold text-white transition hover:bg-indigo-500 disabled:opacity-50">
+              {busy ? <Spinner className="h-4 w-4" /> : 'Suggest'}
+            </button>
+          </div>
+        </div>
+
+        <div className="mx-auto w-full max-w-md flex-1 overflow-y-auto px-5 pb-4 pt-4">
+          {items.length ? (
+            <div className="space-y-2">
+              {items.map((it, i) => (
+                <button key={i} type="button" onClick={() => onToggle(i)} disabled={busy}
+                  className={'no-tap flex w-full items-start gap-3 rounded-xl border p-3 text-left transition disabled:opacity-60 ' + (it.selected
+                    ? 'border-indigo-500 bg-indigo-500/10'
+                    : 'border-gray-700 bg-gray-800 hover:border-gray-600')}>
+                  <span className={'mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-md border transition ' + (it.selected
+                    ? 'border-indigo-400 bg-indigo-500 text-white'
+                    : 'border-gray-600 bg-gray-900')}>
+                    {it.selected ? (
+                      <svg className="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round">
+                        <path d="m5 12 5 5L20 7" />
+                      </svg>
+                    ) : null}
+                  </span>
+                  <span className="min-w-0 flex-1">
+                    <span className="flex flex-wrap items-center gap-2">
+                      <span className="text-sm font-medium text-white">{it.phrase}</span>
+                      {it.source === 'manual' ? (
+                        <span className="rounded bg-gray-700 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-gray-300">yours</span>
+                      ) : it.category ? (
+                        <span className="rounded bg-indigo-500/20 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-indigo-300">{it.category}</span>
+                      ) : null}
+                    </span>
+                    {it.translation ? <span className="mt-0.5 block text-sm text-gray-400">{it.translation}</span> : null}
+                    {it.context ? <span className="mt-1 block text-xs leading-relaxed text-gray-500">{it.context}</span> : null}
+                  </span>
+                </button>
+              ))}
+            </div>
+          ) : (
+            <div className="rounded-xl border border-dashed border-gray-700 bg-gray-800/30 p-4 text-sm text-gray-400">
+              Hit Suggest for ten phrases pitched at your level, or type your own below. Anything you add starts at
+              0/{MASTERY_THRESHOLD} uses and your partner will work it into the next session.
+            </div>
+          )}
+
+          <form onSubmit={submitManual} className="mt-4 rounded-xl border border-gray-800 bg-gray-800/40 p-3.5">
+            <div className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-gray-500">Add your own</div>
+            <div className="space-y-2">
+              <input className={inputClass} type="text" value={manualPhrase} disabled={busy}
+                onChange={e => setManualPhrase(e.target.value)}
+                placeholder={'Phrase in ' + targetLanguage} />
+              <div className="flex gap-2">
+                <input className={inputClass + ' flex-1'} type="text" value={manualTranslation} disabled={busy}
+                  onChange={e => setManualTranslation(e.target.value)}
+                  placeholder="Meaning (optional)" />
+                <button type="submit" disabled={busy || !manualPhrase.trim()}
+                  className="no-tap shrink-0 rounded-xl border border-gray-700 bg-gray-800 px-4 text-sm font-medium text-gray-200 transition hover:border-gray-600 disabled:opacity-40">
+                  Add
+                </button>
+              </div>
+            </div>
+          </form>
+
+          <div className="mt-3 flex h-5 items-center gap-2 text-xs text-gray-500">
+            {busy ? <Spinner className="h-3.5 w-3.5" /> : null}
+            <span>{note}</span>
+          </div>
+        </div>
+
+        <div className="safe-b mx-auto w-full max-w-md border-t border-gray-800 px-5 py-4">
+          <button onClick={onAdd} disabled={busy || !selected.length}
+            className="no-tap flex w-full items-center justify-center gap-2 rounded-xl bg-indigo-600 px-4 py-3.5 text-sm font-semibold text-white transition hover:bg-indigo-500 disabled:opacity-50">
+            {busy ? <Spinner className="h-4 w-4" /> : null}
+            {selected.length ? 'Add ' + selected.length + ' phrase' + (selected.length === 1 ? '' : 's') : 'Select phrases to add'}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ExportSheet({ vocab, targetLanguage, defaultTurkish, busy, note, onExport, onClose }) {
+  const [format, setFormat] = useState('csv');
+  const [withTurkish, setWithTurkish] = useState(defaultTurkish);
+
+  const formats = [
+    { id: 'csv', label: 'CSV', hint: 'Opens in Excel, Numbers, Sheets, Anki' },
+    { id: 'txt', label: 'Text', hint: 'Plain readable list' }
+  ];
+
+  return (
+    <div className="fixed inset-0 z-40 flex flex-col justify-end">
+      <div className="fade-in absolute inset-0 bg-black/60 backdrop-blur-sm" onClick={busy ? undefined : onClose} />
+      <div className="sheet-up relative flex max-h-[88vh] flex-col rounded-t-3xl border-t border-gray-700 bg-gray-900 shadow-2xl">
+        <div className="mx-auto mt-3 h-1.5 w-10 shrink-0 rounded-full bg-gray-700" />
+
+        <div className="mx-auto w-full max-w-md px-5 pt-4">
+          <div className="flex items-center justify-between">
+            <h2 className="text-lg font-semibold tracking-tight">Export vocabulary</h2>
+            <button onClick={onClose} disabled={busy}
+              className="no-tap rounded-lg p-1.5 text-gray-400 transition hover:text-white disabled:opacity-40" aria-label="Close">
+              <svg className="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+                <path d="M18 6 6 18M6 6l12 12" />
+              </svg>
+            </button>
+          </div>
+          <p className="mt-1 text-sm text-gray-400">
+            {vocab.length} active phrase{vocab.length === 1 ? '' : 's'} in {targetLanguage}.
+          </p>
+        </div>
+
+        <div className="mx-auto w-full max-w-md flex-1 overflow-y-auto px-5 pb-4 pt-4">
+          <div className="mb-4">
+            <span className="mb-1.5 block text-xs font-medium uppercase tracking-wider text-gray-400">File format</span>
+            <div className="grid grid-cols-2 gap-2">
+              {formats.map(f => (
+                <button key={f.id} type="button" onClick={() => setFormat(f.id)} disabled={busy}
+                  className={'no-tap rounded-xl border p-3 text-left transition disabled:opacity-50 ' + (format === f.id
+                    ? 'border-indigo-500 bg-indigo-500/15'
+                    : 'border-gray-700 bg-gray-800 hover:border-gray-600')}>
+                  <div className="text-sm font-medium">{f.label}</div>
+                  <div className="mt-0.5 text-xs text-gray-400">{f.hint}</div>
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <button type="button" onClick={() => setWithTurkish(!withTurkish)}
+            disabled={busy || targetLanguage === 'Turkish'}
+            className={'no-tap flex w-full items-start gap-3 rounded-xl border p-3.5 text-left transition disabled:opacity-50 ' + (withTurkish
+              ? 'border-indigo-500 bg-indigo-500/15'
+              : 'border-gray-700 bg-gray-800 hover:border-gray-600')}>
+            <span className={'mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-md border transition ' + (withTurkish
+              ? 'border-indigo-400 bg-indigo-500 text-white'
+              : 'border-gray-600 bg-gray-900')}>
+              {withTurkish ? (
+                <svg className="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="m5 12 5 5L20 7" />
+                </svg>
+              ) : null}
+            </span>
+            <span>
+              <span className="block text-sm font-medium">Include Turkish translations</span>
+              <span className="mt-0.5 block text-xs text-gray-400">
+                {targetLanguage === 'Turkish'
+                  ? 'Your target language is already Turkish.'
+                  : 'Translated with GPT-4o on export, then cached for this session.'}
+              </span>
+            </span>
+          </button>
+
+          <div className="mt-4 rounded-xl border border-gray-800 bg-gray-800/40 p-3.5">
+            <div className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-gray-500">Preview</div>
+            <div className="space-y-1.5">
+              {vocab.slice(0, 3).map(v => (
+                <div key={v.id} className="truncate text-xs text-gray-400">
+                  <span className="text-gray-200">{v.phrase}</span>
+                  {withTurkish ? <span className="text-indigo-400"> · tr</span> : null}
+                  {v.translation ? <span> · {v.translation}</span> : null}
+                </div>
+              ))}
+              {vocab.length > 3 ? (
+                <div className="text-xs text-gray-600">+ {vocab.length - 3} more</div>
+              ) : null}
+            </div>
+          </div>
+
+          <div className="mt-3 flex h-5 items-center gap-2 text-xs text-gray-500">
+            {busy ? <Spinner className="h-3.5 w-3.5" /> : null}
+            <span>{note}</span>
+          </div>
+        </div>
+
+        <div className="safe-b mx-auto w-full max-w-md border-t border-gray-800 px-5 py-4">
+          <button onClick={() => onExport(format, withTurkish && targetLanguage !== 'Turkish')}
+            disabled={busy || !vocab.length}
+            className="no-tap flex w-full items-center justify-center gap-2 rounded-xl bg-indigo-600 px-4 py-3.5 text-sm font-semibold text-white transition hover:bg-indigo-500 disabled:opacity-50">
+            {busy ? <Spinner className="h-4 w-4" /> : null}
+            {busy ? 'Preparing…' : 'Download .' + format}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function Dashboard({
+  profile, vocab, vocabLoading, recommendedTopic, recommendedSource,
+  stats, onStart, onOpenSettings, onShowLastFeedback, hasLastFeedback, onExport,
+  mode, onModeChange, onSuggest
+}) {
+  const [custom, setCustom] = useState('');
+  const chosen = custom.trim() || recommendedTopic;
+
+  return (
+    <div className="mx-auto flex min-h-full w-full max-w-md flex-col px-5 pb-28 pt-8">
+      <header className="mb-7 flex items-start justify-between">
+        <div>
+          <div className="text-xs font-medium uppercase tracking-wider text-indigo-400">
+            {profile.target_language} · {profile.current_cefr}
+          </div>
+          <h1 className="mt-1 text-2xl font-semibold tracking-tight">Today's session</h1>
+          <p className="mt-1 text-sm text-gray-400">
+            {stats.sessions} session{stats.sessions === 1 ? '' : 's'} done · {stats.mastered} phrase{stats.mastered === 1 ? '' : 's'} mastered
+          </p>
+        </div>
+        <button onClick={onOpenSettings}
+          className="no-tap rounded-xl border border-gray-700 bg-gray-800 p-2.5 text-gray-400 transition hover:text-white"
+          aria-label="Settings">
+          <svg className="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
+            <circle cx="12" cy="12" r="3" />
+            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.6a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
+          </svg>
+        </button>
+      </header>
+
+      <section className="mb-7">
+        <div className="mb-2.5 flex items-baseline justify-between">
+          <h2 className="text-sm font-semibold text-gray-200">Active vocabulary</h2>
+          <div className="flex items-center gap-2">
+            <span className="text-xs text-gray-500">{vocab.length} learning</span>
+            <button onClick={onSuggest}
+              className="no-tap flex items-center gap-1.5 rounded-lg border border-gray-700 bg-gray-800 px-2.5 py-1 text-xs font-medium text-gray-300 transition hover:border-gray-600 hover:text-white"
+              title="Add suggested or your own phrases">
+              <svg className="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+                <path d="M12 5v14M5 12h14" />
+              </svg>
+              Add
+            </button>
+            <button onClick={onExport} disabled={!vocab.length}
+              className="no-tap flex items-center gap-1.5 rounded-lg border border-gray-700 bg-gray-800 px-2.5 py-1 text-xs font-medium text-gray-300 transition hover:border-gray-600 hover:text-white disabled:opacity-40"
+              title="Export as CSV or text, with Turkish translations">
+              <svg className="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                <path d="M7 10l5 5 5-5" />
+                <path d="M12 15V3" />
+              </svg>
+              Export
+            </button>
+          </div>
+        </div>
+        <VocabBar vocab={vocab} loading={vocabLoading} onSuggest={onSuggest} />
+      </section>
+
+      <section className="mb-7">
+        <h2 className="mb-2.5 text-sm font-semibold text-gray-200">Topic of the day</h2>
+        <button onClick={() => setCustom('')}
+          className={'no-tap w-full rounded-2xl border p-4 text-left transition ' + (custom.trim()
+            ? 'border-gray-700 bg-gray-800/50 opacity-60'
+            : 'border-indigo-500/60 bg-indigo-500/10')}>
+          <div className="mb-1 flex items-center gap-2 text-[11px] font-semibold uppercase tracking-wider text-indigo-400">
+            <span className="inline-block h-1.5 w-1.5 rounded-full bg-indigo-400" />
+            Recommended · {recommendedSource}
+          </div>
+          <div className="text-[15px] leading-snug text-white">{recommendedTopic}</div>
+        </button>
+
+        <div className="my-3 flex items-center gap-3">
+          <div className="h-px flex-1 bg-gray-800" />
+          <span className="text-[11px] uppercase tracking-wider text-gray-600">or</span>
+          <div className="h-px flex-1 bg-gray-800" />
+        </div>
+
+        <input className={inputClass} type="text" value={custom} onChange={e => setCustom(e.target.value)}
+          placeholder="Talk about something else…" />
+      </section>
+
+      <section className="mb-7">
+        <h2 className="mb-2.5 text-sm font-semibold text-gray-200">Conversation mode</h2>
+        <div className="grid grid-cols-2 gap-2">
+          <button type="button" onClick={() => onModeChange(MODE_TURN)}
+            className={'no-tap rounded-xl border p-3 text-left transition ' + (mode === MODE_TURN
+              ? 'border-indigo-500 bg-indigo-500/15'
+              : 'border-gray-700 bg-gray-800 hover:border-gray-600')}>
+            <div className="text-sm font-medium">Turn-based</div>
+            <div className="mt-0.5 text-xs text-gray-400">You tap to talk. Cheaper, more forgiving.</div>
+          </button>
+          <button type="button" onClick={() => onModeChange(MODE_REALTIME)}
+            className={'no-tap rounded-xl border p-3 text-left transition ' + (mode === MODE_REALTIME
+              ? 'border-indigo-500 bg-indigo-500/15'
+              : 'border-gray-700 bg-gray-800 hover:border-gray-600')}>
+            <div className="flex items-center gap-1.5">
+              <span className="text-sm font-medium">Realtime</span>
+              <span className="rounded bg-emerald-500/20 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-emerald-300">live</span>
+            </div>
+            <div className="mt-0.5 text-xs text-gray-400">Open mic, natural interruptions. Costs more.</div>
+          </button>
+        </div>
+        {mode === MODE_REALTIME ? (
+          <p className="mt-2 text-xs text-gray-500">
+            Speech-to-speech over WebRTC with {REALTIME_MODEL}. The model hears you continuously and you can cut in
+            mid-sentence. Billed at realtime audio rates, so a full 30 minutes is noticeably pricier than turn-based.
+          </p>
+        ) : null}
+      </section>
+
+      {hasLastFeedback ? (
+        <button onClick={onShowLastFeedback}
+          className="no-tap mb-4 w-full rounded-xl border border-gray-700 bg-gray-800/50 px-4 py-3 text-sm text-gray-300 transition hover:border-gray-600">
+          Review last session's feedback
+        </button>
+      ) : null}
+
+      <div className="fixed inset-x-0 bottom-0 safe-b bg-gradient-to-t from-gray-900 via-gray-900/95 to-transparent px-5 pb-5 pt-8">
+        <div className="mx-auto w-full max-w-md">
+          <button onClick={() => onStart(chosen)} disabled={!chosen}
+            className="no-tap w-full rounded-2xl bg-indigo-600 px-4 py-4 text-base font-semibold text-white shadow-lg shadow-indigo-900/40 transition hover:bg-indigo-500 disabled:opacity-40">
+            Start 30-minute {mode === MODE_REALTIME ? 'live call' : 'session'}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* --------------------------------------------------------------- session UI */
+
+const STATUS_COPY = {
+  connecting: 'Connecting the live call…',
+  live: 'Live — just start talking',
+  listening: 'Hearing you…',
+  muted: 'Mic muted — tap to unmute',
+  idle: 'Tap to speak',
+  starting: 'Warming up your partner…',
+  recording: 'Listening… tap to send',
+  transcribing: 'Transcribing your audio…',
+  thinking: 'Thinking of a reply…',
+  synthesizing: 'Generating speech…',
+  speaking: 'Speaking — tap to interrupt',
+  analyzing: 'Analysing your session…'
+};
+
+function TranscriptView({ messages, status, targetLanguage, live }) {
+  const endRef = useRef(null);
+  useEffect(() => {
+    if (endRef.current) endRef.current.scrollIntoView({ behavior: 'smooth', block: 'end' });
+  }, [messages.length, status]);
+
+  if (!messages.length) {
+    return (
+      <div className="flex h-full items-center justify-center px-8 text-center">
+        <p className="text-sm text-gray-500">
+          Your partner will open the conversation in {targetLanguage}. Answer out loud — mistakes are the point.
+          {live ? ' The mic stays open, so just talk. Cut in whenever you like.' : ''}
+        </p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-3 px-1 pb-4">
+      {messages.map((m, i) => (
+        <div key={i} className={'bubble-in flex ' + (m.role === 'user' ? 'justify-end' : 'justify-start')}>
+          <div className={'max-w-[85%] rounded-2xl px-3.5 py-2.5 text-[15px] leading-relaxed ' + (m.role === 'user'
+            ? 'rounded-br-md bg-indigo-600 text-white'
+            : 'rounded-bl-md bg-gray-800 text-gray-100')}>
+            {m.content}
+          </div>
+        </div>
+      ))}
+      {(status === 'thinking' || status === 'synthesizing' || status === 'transcribing') ? (
+        <div className="flex justify-start">
+          <div className="flex items-center gap-2 rounded-2xl rounded-bl-md bg-gray-800 px-3.5 py-3 text-gray-400">
+            <Spinner className="h-4 w-4" />
+            <span className="text-xs">{STATUS_COPY[status]}</span>
+          </div>
+        </div>
+      ) : null}
+      <div ref={endRef} />
+    </div>
+  );
+}
+
+function SessionScreen({
+  profile, topic, messages, status, secondsLeft, onToggleMic, onEnd, micDisabled, vocabCount,
+  mode, muted, connectionState
+}) {
+  const isLive = mode === MODE_REALTIME;
+  const isRecording = status === 'recording' || status === 'listening';
+  const isSpeaking = status === 'speaking';
+  const isBusy = status === 'transcribing' || status === 'thinking' || status === 'synthesizing' ||
+    status === 'starting' || status === 'analyzing' || status === 'connecting';
+  const low = secondsLeft <= 120;
+
+  let buttonClass = 'bg-indigo-600 hover:bg-indigo-500 text-white';
+  if (isLive && muted) buttonClass = 'bg-gray-700 text-gray-300';
+  else if (isRecording) buttonClass = 'bg-red-600 text-white rec-pulse';
+  else if (isSpeaking) buttonClass = 'bg-emerald-600 text-white speak-pulse';
+  else if (isBusy) buttonClass = 'bg-gray-700 text-gray-300';
+
+  let statusText = STATUS_COPY[status] || '';
+  if (isLive && muted && status !== 'connecting') statusText = STATUS_COPY.muted;
+  // In live mode barge-in is handled by voice activity detection, so there is
+  // nothing to tap: the learner just talks over the model.
+  else if (isLive && status === 'speaking') statusText = 'Speaking — just talk to cut in';
+
+  return (
+    <div className="mx-auto flex h-full w-full max-w-md flex-col">
+      <header className="flex items-center justify-between border-b border-gray-800 px-5 py-3.5">
+        <button onClick={onEnd} disabled={status === 'analyzing'}
+          className="no-tap rounded-lg px-2 py-1 text-sm text-gray-400 transition hover:text-white disabled:opacity-40">
+          End &amp; Analyze
+        </button>
+        <div className={'rounded-lg px-3 py-1 font-mono text-sm tabular-nums transition ' + (low
+          ? 'bg-red-500/15 text-red-300'
+          : 'bg-gray-800 text-gray-300')}>
+          {formatClock(secondsLeft)}
+        </div>
+      </header>
+
+      <div className="border-b border-gray-800 px-5 py-2.5">
+        <div className="flex items-center gap-2 truncate text-xs text-gray-500">
+          <span className={'inline-flex shrink-0 items-center gap-1 rounded px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide ' + (isLive
+            ? 'bg-emerald-500/20 text-emerald-300'
+            : 'bg-gray-700/70 text-gray-300')}>
+            {isLive ? (
+              <span className={'inline-block h-1.5 w-1.5 rounded-full ' + (connectionState === 'connected' ? 'bg-emerald-400' : 'bg-amber-400')} />
+            ) : null}
+            {isLive ? 'live' : 'turn-based'}
+          </span>
+          <span className="truncate">
+            <span className="text-gray-400">{profile.target_language} · {profile.current_cefr}</span>
+            {vocabCount ? <span> · {vocabCount} target phrase{vocabCount === 1 ? '' : 's'} in play</span> : null}
+          </span>
+        </div>
+        <div className="mt-0.5 truncate text-sm text-gray-300" title={topic}>{topic}</div>
+      </div>
+
+      <main className="flex-1 overflow-y-auto px-4 py-4">
+        <TranscriptView messages={messages} status={status} targetLanguage={profile.target_language} live={isLive} />
+      </main>
+
+      <footer className="safe-b border-t border-gray-800 bg-gray-900/80 px-5 pb-6 pt-5 backdrop-blur">
+        <div className="flex flex-col items-center gap-3">
+          <button onClick={onToggleMic} disabled={micDisabled || (isLive ? status === 'connecting' || status === 'analyzing' : isBusy)}
+            className={'no-tap flex h-24 w-24 items-center justify-center rounded-full transition-all duration-200 active:scale-95 disabled:opacity-60 ' + buttonClass}
+            aria-label={isLive ? (muted ? 'Unmute microphone' : 'Mute microphone') : (isRecording ? 'Stop recording' : 'Start recording')}>
+            {isLive ? (
+              status === 'connecting' ? <Spinner className="h-8 w-8" />
+                : muted ? <MicOffIcon className="h-9 w-9" />
+                : isSpeaking ? (
+                  <span className="eq flex h-8 items-center text-white">
+                    <span /><span /><span /><span />
+                  </span>
+                ) : <MicIcon className="h-9 w-9" />
+            ) : (
+              isBusy ? <Spinner className="h-8 w-8" />
+                : isRecording ? <StopIcon className="h-8 w-8" />
+                : isSpeaking ? (
+                  <span className="eq flex h-8 items-center text-white">
+                    <span /><span /><span /><span />
+                  </span>
+                ) : <MicIcon className="h-9 w-9" />
+            )}
+          </button>
+          <div className={'h-5 text-xs font-medium ' + (isLive && muted ? 'text-gray-400' : isRecording ? 'text-red-400' : isSpeaking ? 'text-emerald-400' : 'text-gray-400')}>
+            {statusText}
+          </div>
+        </div>
+      </footer>
+    </div>
+  );
+}
+
+/* --------------------------------------------------------- feedback bottom sheet */
+
+function FeedbackSheet({ feedback, saving, saveNote, onClose }) {
+  const [tab, setTab] = useState('grammar');
+  if (!feedback) return null;
+
+  const mistakes = Array.isArray(feedback.grammar_mistakes) ? feedback.grammar_mistakes : [];
+  const phrases = Array.isArray(feedback.recommended_phrases) ? feedback.recommended_phrases : [];
+
+  const tabs = [
+    { id: 'grammar', label: 'Grammar', count: mistakes.length },
+    { id: 'vocab', label: 'New Vocab', count: phrases.length },
+    { id: 'summary', label: 'Summary', count: null }
+  ];
+
+  return (
+    <div className="fixed inset-0 z-40 flex flex-col justify-end">
+      <div className="fade-in absolute inset-0 bg-black/60 backdrop-blur-sm" onClick={onClose} />
+      <div className="sheet-up relative flex max-h-[88vh] flex-col rounded-t-3xl border-t border-gray-700 bg-gray-900 shadow-2xl">
+        <div className="mx-auto mt-3 h-1.5 w-10 shrink-0 rounded-full bg-gray-700" />
+
+        <div className="mx-auto w-full max-w-md px-5 pt-4">
+          <div className="flex items-center justify-between">
+            <h2 className="text-lg font-semibold tracking-tight">Session analysis</h2>
+            <button onClick={onClose} className="no-tap rounded-lg p-1.5 text-gray-400 transition hover:text-white" aria-label="Close">
+              <svg className="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+                <path d="M18 6 6 18M6 6l12 12" />
+              </svg>
+            </button>
+          </div>
+
+          <div className="mt-2 flex h-5 items-center gap-2 text-xs text-gray-500">
+            {saving ? <Spinner className="h-3.5 w-3.5" /> : null}
+            <span>{saveNote}</span>
+          </div>
+
+          <div className="mt-3 flex gap-1.5 rounded-xl bg-gray-800/70 p-1">
+            {tabs.map(t => (
+              <button key={t.id} onClick={() => setTab(t.id)}
+                className={'no-tap flex-1 rounded-lg px-2 py-2 text-xs font-medium transition ' + (tab === t.id
+                  ? 'bg-gray-700 text-white'
+                  : 'text-gray-400 hover:text-gray-200')}>
+                {t.label}{t.count !== null ? ' (' + t.count + ')' : ''}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <div className="mx-auto w-full max-w-md flex-1 overflow-y-auto px-5 pb-8 pt-4">
+          {tab === 'grammar' ? (
+            mistakes.length ? (
+              <div className="space-y-3">
+                {mistakes.map((m, i) => (
+                  <div key={i} className="rounded-xl border border-gray-800 bg-gray-800/50 p-3.5">
+                    <div className="text-sm text-red-300 line-through decoration-red-500/50">{m.original}</div>
+                    <div className="mt-1.5 text-sm font-medium text-emerald-300">{m.correction}</div>
+                    <div className="mt-2 border-t border-gray-700/60 pt-2 text-xs leading-relaxed text-gray-400">
+                      {m.explanation}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <p className="py-8 text-center text-sm text-gray-500">No grammar mistakes worth flagging. Clean run.</p>
+            )
+          ) : null}
+
+          {tab === 'vocab' ? (
+            phrases.length ? (
+              <div className="space-y-3">
+                {phrases.map((p, i) => (
+                  <div key={i} className="rounded-xl border border-gray-800 bg-gray-800/50 p-3.5">
+                    <div className="text-sm font-medium text-white">{p.phrase}</div>
+                    <div className="mt-0.5 text-sm text-gray-400">{p.translation}</div>
+                    {p.context ? (
+                      <div className="mt-2 border-t border-gray-700/60 pt-2 text-xs leading-relaxed text-gray-500">
+                        {p.context}
+                      </div>
+                    ) : null}
+                  </div>
+                ))}
+                <p className="pt-1 text-center text-xs text-gray-600">
+                  Saved to your active vocabulary — your partner will work them into the next session.
+                </p>
+              </div>
+            ) : (
+              <p className="py-8 text-center text-sm text-gray-500">No new phrases recommended this time.</p>
+            )
+          ) : null}
+
+          {tab === 'summary' ? (
+            <div className="space-y-4">
+              <div className="rounded-xl border border-gray-800 bg-gray-800/50 p-4">
+                <div className="mb-1.5 text-[11px] font-semibold uppercase tracking-wider text-indigo-400">
+                  Level feedback
+                </div>
+                <p className="text-sm leading-relaxed text-gray-300">{feedback.cefr_level_feedback || '—'}</p>
+              </div>
+              <div className="rounded-xl border border-gray-800 bg-gray-800/50 p-4">
+                <div className="mb-1.5 text-[11px] font-semibold uppercase tracking-wider text-emerald-400">
+                  Next session topic
+                </div>
+                <p className="text-sm leading-relaxed text-gray-300">{feedback.next_topic_recommendation || '—'}</p>
+              </div>
+              {Array.isArray(feedback.mastered_now) && feedback.mastered_now.length ? (
+                <div className="rounded-xl border border-emerald-800/50 bg-emerald-500/10 p-4">
+                  <div className="mb-1.5 text-[11px] font-semibold uppercase tracking-wider text-emerald-400">
+                    Mastered this session
+                  </div>
+                  <p className="text-sm leading-relaxed text-emerald-200">{feedback.mastered_now.join(' · ')}</p>
+                </div>
+              ) : null}
+            </div>
+          ) : null}
+        </div>
+
+        <div className="safe-b mx-auto w-full max-w-md border-t border-gray-800 px-5 py-4">
+          <button onClick={onClose}
+            className="no-tap w-full rounded-xl bg-indigo-600 px-4 py-3.5 text-sm font-semibold text-white transition hover:bg-indigo-500">
+            Back to dashboard
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------------------- App */
+
+function App() {
+  const [config, setConfig] = useState(loadConfig);
+  const [client, setClient] = useState(null);
+  const [profile, setProfile] = useState(null);
+  const [screen, setScreen] = useState(loadConfig() ? 'loading' : 'setup');
+  const [toast, setToast] = useState(null);
+
+  const [vocab, setVocab] = useState([]);
+  const [vocabLoading, setVocabLoading] = useState(true);
+  const [stats, setStats] = useState({ sessions: 0, mastered: 0 });
+  const [recommended, setRecommended] = useState({ topic: FALLBACK_TOPICS[0], source: 'starter' });
+
+  const [topic, setTopic] = useState('');
+  const [mode, setMode] = useState(() => {
+    const cfg = loadConfig();
+    return cfg && cfg.conversationMode === MODE_REALTIME ? MODE_REALTIME : MODE_TURN;
+  });
+  const [messages, setMessages] = useState([]);
+  const [status, setStatus] = useState('idle');
+  const [muted, setMuted] = useState(false);
+  const [connectionState, setConnectionState] = useState('');
+  const [secondsLeft, setSecondsLeft] = useState(SESSION_SECONDS);
+  const [micDisabled, setMicDisabled] = useState(false);
+
+  const [feedback, setFeedback] = useState(null);
+  const [sheetOpen, setSheetOpen] = useState(false);
+  const [suggestOpen, setSuggestOpen] = useState(false);
+  const [suggestBusy, setSuggestBusy] = useState(false);
+  const [suggestNote, setSuggestNote] = useState('');
+  const [suggestItems, setSuggestItems] = useState([]);
+  const [exportOpen, setExportOpen] = useState(false);
+  const [exportBusy, setExportBusy] = useState(false);
+  const [exportNote, setExportNote] = useState('');
+  const [savingFeedback, setSavingFeedback] = useState(false);
+  const [saveNote, setSaveNote] = useState('');
+
+  // Refs that must not trigger re-renders.
+  const audioRef = useRef(null);
+  const audioUrlRef = useRef(null);
+  const recorderRef = useRef(null);
+  const streamRef = useRef(null);
+  const chunksRef = useRef([]);
+  const messagesRef = useRef([]);
+  const sessionVocabRef = useRef([]);
+  const endingRef = useRef(false);
+  const statusRef = useRef('idle');
+  const turkishCacheRef = useRef(new Map());
+  const realtimeRef = useRef(null);
+  const realtimeDcRef = useRef(null);
+  const realtimeItemsRef = useRef([]);
+  const modeRef = useRef(MODE_TURN);
+
+  useEffect(() => { messagesRef.current = messages; }, [messages]);
+  useEffect(() => { statusRef.current = status; }, [status]);
+  useEffect(() => { modeRef.current = mode; }, [mode]);
+
+  const changeMode = useCallback((next) => {
+    setMode(next);
+    const cfg = loadConfig();
+    if (cfg) saveConfig(Object.assign({}, cfg, { conversationMode: next }));
+  }, []);
+
+  const pushToast = useCallback((type, message) => {
+    setToast({ type: type, message: message });
+  }, []);
+  const dismissToast = useCallback(() => setToast(null), []);
+
+  /* ------------------------------------------------------------ audio utils */
+
+  const stopPlayback = useCallback(() => {
+    if (audioRef.current) {
+      audioRef.current.pause();
+      audioRef.current.currentTime = 0;
+    }
+    if (audioUrlRef.current) {
+      URL.revokeObjectURL(audioUrlRef.current);
+      audioUrlRef.current = null;
+    }
+  }, []);
+
+  const releaseMic = useCallback(() => {
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach(t => t.stop());
+      streamRef.current = null;
+    }
+    recorderRef.current = null;
+    chunksRef.current = [];
+  }, []);
+
+  const playAudioBlob = useCallback(async (blob) => {
+    stopPlayback();
+    const url = URL.createObjectURL(blob);
+    audioUrlRef.current = url;
+    if (!audioRef.current) audioRef.current = new Audio();
+    const audio = audioRef.current;
+    audio.src = url;
+    audio.onended = () => {
+      if (statusRef.current === 'speaking') setStatus('idle');
+    };
+    audio.onerror = () => {
+      if (statusRef.current === 'speaking') setStatus('idle');
+    };
+    setStatus('speaking');
+    try {
+      await audio.play();
+    } catch (err) {
+      // Autoplay blocked or interrupted by the user tapping the mic.
+      if (statusRef.current === 'speaking') setStatus('idle');
+    }
+  }, [stopPlayback]);
+
+  /* --------------------------------------------------------- data fetching */
+
+  const refreshVocab = useCallback(async (c) => {
+    const db = c || client;
+    if (!db) return [];
+    setVocabLoading(true);
+    try {
+      const res = await db
+        .from('target_vocabulary')
+        .select('*')
+        .eq('user_id', DEFAULT_USER)
+        .eq('status', 'learning')
+        .order('created_at', { ascending: true });
+      if (res.error) throw new Error(res.error.message);
+      const rows = res.data || [];
+      setVocab(rows);
+      return rows;
+    } catch (err) {
+      pushToast('error', 'Could not load vocabulary: ' + err.message);
+      return [];
+    } finally {
+      setVocabLoading(false);
+    }
+  }, [client, pushToast]);
+
+  const refreshStats = useCallback(async (c) => {
+    const db = c || client;
+    if (!db) return;
+    try {
+      const [sessionsRes, masteredRes] = await Promise.all([
+        db.from('conversations').select('id', { count: 'exact', head: true }).eq('user_id', DEFAULT_USER),
+        db.from('target_vocabulary').select('id', { count: 'exact', head: true }).eq('user_id', DEFAULT_USER).eq('status', 'mastered')
+      ]);
+      setStats({
+        sessions: sessionsRes.count || 0,
+        mastered: masteredRes.count || 0
+      });
+    } catch (err) {
+      console.warn('stats failed', err);
+    }
+  }, [client]);
+
+  const refreshRecommendedTopic = useCallback(async (c, vocabRows) => {
+    const db = c || client;
+    if (!db) return;
+    try {
+      const res = await db
+        .from('conversations')
+        .select('feedback, topic, created_at')
+        .eq('user_id', DEFAULT_USER)
+        .order('created_at', { ascending: false })
+        .limit(1);
+      if (res.error) throw new Error(res.error.message);
+
+      const last = (res.data || [])[0];
+      const fromFeedback = last && last.feedback && last.feedback.next_topic_recommendation;
+      if (fromFeedback) {
+        setRecommended({ topic: fromFeedback, source: 'from last session' });
+        return;
+      }
+
+      const rows = vocabRows || vocab;
+      if (rows && rows.length) {
+        const picks = rows.slice(0, 3).map(v => '"' + v.phrase + '"').join(', ');
+        setRecommended({
+          topic: 'A conversation where you naturally need ' + picks + '.',
+          source: 'from your active vocabulary'
+        });
+        return;
+      }
+
+      const idx = new Date().getDate() % FALLBACK_TOPICS.length;
+      setRecommended({ topic: FALLBACK_TOPICS[idx], source: 'starter' });
+    } catch (err) {
+      console.warn('topic recommendation failed', err);
+      const idx = new Date().getDate() % FALLBACK_TOPICS.length;
+      setRecommended({ topic: FALLBACK_TOPICS[idx], source: 'starter' });
+    }
+  }, [client, vocab]);
+
+  /* ------------------------------------------------------------ boot / init */
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function boot() {
+      const cfg = config;
+      if (!cfg) { setScreen('setup'); return; }
+
+      try {
+        const db = window.supabase.createClient(cfg.supabaseUrl, cfg.supabaseKey);
+        if (cancelled) return;
+        setClient(db);
+
+        const prof = await db.from('profiles').select('*').eq('user_id', DEFAULT_USER).maybeSingle();
+        if (prof.error) throw new Error(prof.error.message);
+
+        let row = prof.data;
+        if (!row) {
+          const ins = await db.from('profiles').insert({ user_id: DEFAULT_USER }).select().single();
+          if (ins.error) throw new Error(ins.error.message);
+          row = ins.data;
+        }
+        if (cancelled) return;
+        setProfile(row);
+        setScreen('dashboard');
+
+        const rows = await refreshVocab(db);
+        if (cancelled) return;
+        await Promise.all([refreshStats(db), refreshRecommendedTopic(db, rows)]);
+      } catch (err) {
+        if (cancelled) return;
+        console.error(err);
+        pushToast('error', 'Connection failed: ' + err.message + ' — check your settings.');
+        setScreen('setup');
+      }
+    }
+
+    if (config && !client) boot();
+    else if (!config) setScreen('setup');
+
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [config]);
+
+  /* ------------------------------------------------------------ the timer */
+
+  useEffect(() => {
+    if (screen !== 'session') return undefined;
+    const id = setInterval(() => {
+      setSecondsLeft(prev => {
+        if (prev <= 1) {
+          clearInterval(id);
+          return 0;
+        }
+        return prev - 1;
+      });
+    }, 1000);
+    return () => clearInterval(id);
+  }, [screen]);
+
+  useEffect(() => {
+    if (screen === 'session' && secondsLeft === 0 && !endingRef.current) {
+      pushToast('info', "Time's up — analysing your session.");
+      endSession();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [secondsLeft, screen]);
+
+  /* ------------------------------------------------------- realtime session */
+
+  const teardownRealtime = useCallback(() => {
+    if (realtimeRef.current) {
+      try { realtimeRef.current.close(); } catch (e) { /* noop */ }
+      realtimeRef.current = null;
+    }
+    realtimeDcRef.current = null;
+  }, []);
+
+  // Items are tracked by their server-side id so the transcript keeps the order
+  // the conversation actually happened in, even though a user transcription can
+  // land after the reply it triggered.
+  const syncRealtimeTranscript = useCallback(() => {
+    const rows = realtimeItemsRef.current
+      .filter(it => it.content && it.content.trim())
+      .map(it => ({ role: it.role, content: it.content.trim() }));
+    messagesRef.current = rows;
+    setMessages(rows);
+  }, []);
+
+  const upsertRealtimeItem = useCallback((id, role, content) => {
+    if (!id) return;
+    const items = realtimeItemsRef.current;
+    let item = items.find(it => it.id === id);
+    if (!item) {
+      item = { id: id, role: role || 'assistant', content: '' };
+      items.push(item);
+    }
+    if (role) item.role = role;
+    if (typeof content === 'string') item.content = content;
+    syncRealtimeTranscript();
+  }, [syncRealtimeTranscript]);
+
+  const handleRealtimeEvent = useCallback((event) => {
+    if (!event || !event.type) return;
+
+    switch (event.type) {
+      // Establishes ordering as soon as the server creates the item.
+      case 'conversation.item.added':
+      case 'conversation.item.created': {
+        const item = event.item;
+        if (item && item.id && (item.role === 'user' || item.role === 'assistant')) {
+          upsertRealtimeItem(item.id, item.role, undefined);
+        }
+        break;
+      }
+
+      case 'conversation.item.input_audio_transcription.completed':
+        upsertRealtimeItem(event.item_id, 'user', event.transcript || '');
+        break;
+
+      case 'conversation.item.input_audio_transcription.failed':
+        console.warn('Transcription failed', event);
+        break;
+
+      // Event name differs between the preview and GA surfaces; accept both.
+      case 'response.output_audio_transcript.done':
+      case 'response.audio_transcript.done':
+        upsertRealtimeItem(event.item_id, 'assistant', event.transcript || '');
+        break;
+
+      case 'input_audio_buffer.speech_started':
+        setStatus('listening');
+        break;
+
+      case 'input_audio_buffer.speech_stopped':
+        if (statusRef.current === 'listening') setStatus('live');
+        break;
+
+      case 'response.created':
+        setStatus('speaking');
+        break;
+
+      case 'response.done':
+        if (statusRef.current === 'speaking') setStatus('live');
+        break;
+
+      case 'error': {
+        const msg = event.error && event.error.message ? event.error.message : 'Realtime error.';
+        console.error('Realtime error', event);
+        pushToast('error', msg);
+        break;
+      }
+
+      default:
+        break;
+    }
+  }, [upsertRealtimeItem, pushToast]);
+
+  const startRealtimeSession = useCallback(async (chosenTopic) => {
+    const sessionConfig = buildRealtimeSession(profile, chosenTopic, sessionVocabRef.current, config.voice);
+
+    try {
+      const conn = await connectRealtime(config.openaiKey, sessionConfig, {
+        onOpen: (dc) => {
+          realtimeDcRef.current = dc;
+          // Re-send the config on the channel: it is the only path that applies
+          // when the connection was made with the raw key rather than a secret.
+          dc.send(JSON.stringify({ type: 'session.update', session: sessionConfig }));
+          dc.send(JSON.stringify({
+            type: 'response.create',
+            response: {
+              instructions: 'Greet the learner briefly in ' + profile.target_language +
+                ' and ask one opening question about the topic. Two sentences maximum.'
+            }
+          }));
+          setStatus('live');
+        },
+        onEvent: handleRealtimeEvent,
+        onConnectionState: (state) => {
+          setConnectionState(state);
+          if (state === 'failed' || state === 'disconnected') {
+            pushToast('error', 'The realtime connection dropped. End the session to save what you have.');
+            setStatus('live');
+          }
+        }
+      });
+
+      realtimeRef.current = conn;
+      setMuted(false);
+    } catch (err) {
+      console.error(err);
+      teardownRealtime();
+      pushToast('error', 'Could not start realtime: ' + (err.message || String(err)));
+      setScreen('dashboard');
+      setStatus('idle');
+    }
+  }, [profile, config, handleRealtimeEvent, teardownRealtime, pushToast]);
+
+  const toggleMute = useCallback(() => {
+    const conn = realtimeRef.current;
+    if (!conn || !conn.micStream) return;
+    const next = !muted;
+    conn.micStream.getAudioTracks().forEach(t => { t.enabled = !next; });
+    setMuted(next);
+  }, [muted]);
+
+  useEffect(() => {
+    return () => {
+      stopPlayback();
+      releaseMic();
+      teardownRealtime();
+    };
+  }, [stopPlayback, releaseMic, teardownRealtime]);
+
+  /* --------------------------------------------------------- session start */
+
+  const startSession = useCallback(async (chosenTopic) => {
+    if (!chosenTopic || !profile) return;
+
+    endingRef.current = false;
+    setTopic(chosenTopic);
+    setMessages([]);
+    messagesRef.current = [];
+    setSecondsLeft(SESSION_SECONDS);
+    setFeedback(null);
+    setSheetOpen(false);
+    setMicDisabled(false);
+    sessionVocabRef.current = vocab.slice();
+    realtimeItemsRef.current = [];
+    setConnectionState('');
+    setMuted(false);
+    setScreen('session');
+
+    if (mode === MODE_REALTIME) {
+      setStatus('connecting');
+      await startRealtimeSession(chosenTopic);
+      return;
+    }
+
+    setStatus('starting');
+
+    const systemPrompt = buildSystemPrompt(profile, chosenTopic, sessionVocabRef.current);
+
+    try {
+      const opener = await chatCompletion(config.openaiKey, [
+        { role: 'system', content: systemPrompt },
+        {
+          role: 'user',
+          content: '[The session begins now. Greet me briefly in ' + profile.target_language +
+            ' and ask one opening question about the topic. Two sentences maximum.]'
+        }
+      ], { maxTokens: 160, temperature: 0.9 });
+
+      if (!opener) throw new Error('Empty opening line from the model.');
+
+      const next = [{ role: 'assistant', content: opener }];
+      setMessages(next);
+      messagesRef.current = next;
+
+      const speech = await synthesizeSpeech(config.openaiKey, opener, config.voice);
+      await playAudioBlob(speech);
+    } catch (err) {
+      console.error(err);
+      pushToast('error', err.message);
+      setStatus('idle');
+    }
+  }, [profile, vocab, config, mode, startRealtimeSession, playAudioBlob, pushToast]);
+
+  /* --------------------------------------------------------- the voice turn */
+
+  const handleRecordedAudio = useCallback(async (blob) => {
+    if (!blob || blob.size < 1200) {
+      setStatus('idle');
+      pushToast('info', 'That recording was too short to hear. Hold the button a little longer.');
+      return;
+    }
+
+    setStatus('transcribing');
+    try {
+      const text = await transcribeAudio(config.openaiKey, blob, profile.target_language);
+      if (!text) {
+        setStatus('idle');
+        pushToast('info', 'Nothing was picked up. Try again a bit closer to the mic.');
+        return;
+      }
+
+      const withUser = messagesRef.current.concat([{ role: 'user', content: text }]);
+      setMessages(withUser);
+      messagesRef.current = withUser;
+
+      setStatus('thinking');
+      const systemPrompt = buildSystemPrompt(profile, topic, sessionVocabRef.current);
+      const reply = await chatCompletion(
+        config.openaiKey,
+        [{ role: 'system', content: systemPrompt }].concat(withUser),
+        { maxTokens: 200, temperature: 0.85 }
+      );
+      if (!reply) throw new Error('Empty reply from the model.');
+
+      const withAssistant = messagesRef.current.concat([{ role: 'assistant', content: reply }]);
+      setMessages(withAssistant);
+      messagesRef.current = withAssistant;
+
+      setStatus('synthesizing');
+      const speech = await synthesizeSpeech(config.openaiKey, reply, config.voice);
+      await playAudioBlob(speech);
+    } catch (err) {
+      console.error(err);
+      pushToast('error', err.message);
+      setStatus('idle');
+    }
+  }, [config, profile, topic, playAudioBlob, pushToast]);
+
+  const startRecording = useCallback(async () => {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      setMicDisabled(true);
+      pushToast('error', 'This browser has no microphone API. Use Chrome, Edge or Safari over https or localhost.');
+      return;
+    }
+    if (typeof MediaRecorder === 'undefined') {
+      setMicDisabled(true);
+      pushToast('error', 'MediaRecorder is not supported in this browser.');
+      return;
+    }
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+      });
+      streamRef.current = stream;
+
+      const mime = pickRecorderMime();
+      const recorder = mime ? new MediaRecorder(stream, { mimeType: mime }) : new MediaRecorder(stream);
+      recorderRef.current = recorder;
+      chunksRef.current = [];
+
+      recorder.ondataavailable = (e) => {
+        if (e.data && e.data.size > 0) chunksRef.current.push(e.data);
+      };
+      recorder.onstop = () => {
+        const type = recorder.mimeType || mime || 'audio/webm';
+        const blob = new Blob(chunksRef.current, { type: type });
+        chunksRef.current = [];
+        if (streamRef.current) {
+          streamRef.current.getTracks().forEach(t => t.stop());
+          streamRef.current = null;
+        }
+        recorderRef.current = null;
+        handleRecordedAudio(blob);
+      };
+      recorder.onerror = (e) => {
+        console.error(e);
+        pushToast('error', 'Recording failed. Try again.');
+        setStatus('idle');
+        releaseMic();
+      };
+
+      recorder.start();
+      setStatus('recording');
+    } catch (err) {
+      console.error(err);
+      setStatus('idle');
+      if (err && (err.name === 'NotAllowedError' || err.name === 'SecurityError')) {
+        pushToast('error', 'Microphone access denied. Allow the mic for this page and try again.');
+      } else if (err && err.name === 'NotFoundError') {
+        pushToast('error', 'No microphone found on this device.');
+      } else {
+        pushToast('error', 'Could not start recording: ' + (err.message || err.name));
+      }
+    }
+  }, [handleRecordedAudio, pushToast, releaseMic]);
+
+  const toggleMic = useCallback(() => {
+    if (modeRef.current === MODE_REALTIME) {
+      toggleMute();
+      return;
+    }
+
+    if (status === 'recording') {
+      if (recorderRef.current && recorderRef.current.state !== 'inactive') {
+        recorderRef.current.stop();
+      }
+      setStatus('transcribing');
+      return;
+    }
+
+    // Interruption: tapping the mic while the partner is talking kills playback instantly.
+    if (status === 'speaking') {
+      stopPlayback();
+    }
+
+    if (status === 'idle' || status === 'speaking') {
+      startRecording();
+    }
+  }, [status, stopPlayback, startRecording, toggleMute]);
+
+  /* ------------------------------------------------------- end and analyse */
+
+  const endSession = useCallback(async () => {
+    if (endingRef.current) return;
+    endingRef.current = true;
+
+    if (recorderRef.current && recorderRef.current.state !== 'inactive') {
+      try { recorderRef.current.onstop = null; recorderRef.current.stop(); } catch (e) { /* noop */ }
+    }
+    releaseMic();
+    stopPlayback();
+    teardownRealtime();
+    setConnectionState('');
+    setStatus('analyzing');
+
+    const transcript = messagesRef.current.slice();
+    const usedSeconds = SESSION_SECONDS - secondsLeft;
+    const sessionTopic = topic;
+    const sessionVocab = sessionVocabRef.current.slice();
+
+    const userTurns = transcript.filter(m => m.role === 'user');
+    if (!userTurns.length) {
+      pushToast('info', 'No speech recorded, so there is nothing to analyse.');
+      setScreen('dashboard');
+      setStatus('idle');
+      endingRef.current = false;
+      return;
+    }
+
+    let parsed = null;
+    try {
+      const raw = await chatCompletion(config.openaiKey, [
+        { role: 'system', content: 'You are a meticulous language assessor. You always reply with a single valid JSON object and nothing else.' },
+        { role: 'user', content: buildAnalysisPrompt(profile, sessionTopic, transcript, sessionVocab) }
+      ], { json: true, temperature: 0.3, maxTokens: 1600 });
+
+      const cleaned = raw.replace(/^```(?:json)?/i, '').replace(/```$/, '').trim();
+      parsed = JSON.parse(cleaned);
+    } catch (err) {
+      console.error(err);
+      pushToast('error', 'Analysis failed: ' + err.message);
+      setScreen('dashboard');
+      setStatus('idle');
+      endingRef.current = false;
+      return;
+    }
+
+    const analysis = {
+      grammar_mistakes: Array.isArray(parsed.grammar_mistakes) ? parsed.grammar_mistakes : [],
+      recommended_phrases: Array.isArray(parsed.recommended_phrases) ? parsed.recommended_phrases : [],
+      next_topic_recommendation: parsed.next_topic_recommendation || '',
+      cefr_level_feedback: parsed.cefr_level_feedback || ''
+    };
+
+    // Vocab progression engine — a phrase counts as reviewed when the local scan of the
+    // learner's own words finds it, or when the analyser reports the learner produced it
+    // (which catches conjugated, split and declined forms the string scan cannot see).
+    const learnerText = userTurns.map(m => m.content).join(' \n ');
+    const modelUsed = new Set(
+      (Array.isArray(parsed.used_target_phrases) ? parsed.used_target_phrases : [])
+        .map(p => normalizeText(p))
+        .filter(Boolean)
+    );
+    const progressed = [];
+    const masteredNow = [];
+    for (const v of sessionVocab) {
+      if (phraseWasUsed(v.phrase, learnerText) || modelUsed.has(normalizeText(v.phrase))) {
+        const times = (v.times_reviewed || 0) + 1;
+        const nextStatus = times >= MASTERY_THRESHOLD ? 'mastered' : 'learning';
+        progressed.push({ id: v.id, phrase: v.phrase, times_reviewed: times, status: nextStatus });
+        if (nextStatus === 'mastered') masteredNow.push(v.phrase);
+      }
+    }
+    analysis.mastered_now = masteredNow;
+
+    setFeedback(analysis);
+    setSheetOpen(true);
+    setScreen('dashboard');
+    setStatus('idle');
+    setSavingFeedback(true);
+    setSaveNote('Saving to your database…');
+
+    const problems = [];
+
+    // 1. Insert newly recommended phrases (skip ones already tracked).
+    try {
+      if (analysis.recommended_phrases.length && client) {
+        const existing = await client
+          .from('target_vocabulary')
+          .select('phrase')
+          .eq('user_id', DEFAULT_USER);
+        if (existing.error) throw new Error(existing.error.message);
+
+        const known = new Set((existing.data || []).map(r => normalizeText(r.phrase)));
+        const rows = analysis.recommended_phrases
+          .filter(p => p && p.phrase && !known.has(normalizeText(p.phrase)))
+          .map(p => ({
+            user_id: DEFAULT_USER,
+            phrase: String(p.phrase).trim(),
+            translation: p.translation ? String(p.translation).trim() : null,
+            correction_context: p.context ? String(p.context).trim() : null,
+            times_reviewed: 0,
+            status: 'learning'
+          }));
+
+        if (rows.length) {
+          const ins = await client.from('target_vocabulary').insert(rows);
+          if (ins.error) throw new Error(ins.error.message);
+        }
+      }
+    } catch (err) {
+      console.error(err);
+      problems.push('new vocabulary');
+    }
+
+    // 2. Apply the progression updates.
+    try {
+      if (progressed.length && client) {
+        for (const p of progressed) {
+          const upd = await client
+            .from('target_vocabulary')
+            .update({ times_reviewed: p.times_reviewed, status: p.status })
+            .eq('id', p.id);
+          if (upd.error) throw new Error(upd.error.message);
+        }
+      }
+    } catch (err) {
+      console.error(err);
+      problems.push('vocabulary progress');
+    }
+
+    // 3. Persist the conversation itself.
+    try {
+      if (client) {
+        const ins = await client.from('conversations').insert({
+          user_id: DEFAULT_USER,
+          topic: sessionTopic,
+          duration_seconds: usedSeconds,
+          transcript: transcript,
+          feedback: analysis
+        });
+        if (ins.error) throw new Error(ins.error.message);
+      }
+    } catch (err) {
+      console.error(err);
+      problems.push('session transcript');
+    }
+
+    setSavingFeedback(false);
+    if (problems.length) {
+      setSaveNote('Could not save: ' + problems.join(', ') + '.');
+      pushToast('error', 'Some data did not save: ' + problems.join(', ') + '.');
+    } else {
+      const bits = [];
+      if (analysis.recommended_phrases.length) bits.push(analysis.recommended_phrases.length + ' new phrases');
+      if (progressed.length) bits.push(progressed.length + ' reviewed');
+      if (masteredNow.length) bits.push(masteredNow.length + ' mastered');
+      setSaveNote('Saved' + (bits.length ? ' · ' + bits.join(' · ') : '') + '.');
+    }
+
+    const rows = await refreshVocab(client);
+    await Promise.all([refreshStats(client), refreshRecommendedTopic(client, rows)]);
+    endingRef.current = false;
+  }, [client, config, profile, topic, secondsLeft, releaseMic, stopPlayback, teardownRealtime, pushToast, refreshVocab, refreshStats, refreshRecommendedTopic]);
+
+  /* ---------------------------------------------------- phrase suggestions */
+
+  const fetchKnownPhrases = useCallback(async () => {
+    if (!client) return [];
+    const res = await client
+      .from('target_vocabulary')
+      .select('phrase')
+      .eq('user_id', DEFAULT_USER);
+    if (res.error) throw new Error(res.error.message);
+    return (res.data || []).map(r => r.phrase).filter(Boolean);
+  }, [client]);
+
+  const openSuggest = useCallback(() => {
+    setSuggestItems([]);
+    setSuggestNote('');
+    setSuggestOpen(true);
+  }, []);
+
+  const generateSuggestions = useCallback(async (theme) => {
+    if (!profile) return;
+    setSuggestBusy(true);
+    setSuggestNote('Looking for phrases worth your time…');
+    try {
+      const known = await fetchKnownPhrases();
+      const fresh = await suggestStarterPhrases(config.openaiKey, profile, theme, known);
+      if (!fresh.length) {
+        setSuggestNote('Nothing new came back. Try a different theme.');
+      } else {
+        setSuggestNote(fresh.length + ' suggestions — untick anything you do not want.');
+      }
+      // Keep whatever the learner typed by hand, replace the generated batch.
+      setSuggestItems(prev => prev
+        .filter(it => it.source === 'manual')
+        .concat(fresh.map(f => Object.assign({}, f, { selected: true }))));
+    } catch (err) {
+      console.error(err);
+      setSuggestNote('');
+      pushToast('error', 'Could not fetch suggestions: ' + (err.message || String(err)));
+    } finally {
+      setSuggestBusy(false);
+    }
+  }, [profile, config, fetchKnownPhrases, pushToast]);
+
+  const toggleSuggestion = useCallback((index) => {
+    setSuggestItems(prev => prev.map((it, i) => (i === index ? Object.assign({}, it, { selected: !it.selected }) : it)));
+  }, []);
+
+  const addManualPhrase = useCallback((phrase, translation) => {
+    const key = normalizeText(phrase);
+    let duplicate = false;
+    setSuggestItems(prev => {
+      if (prev.some(it => normalizeText(it.phrase) === key)) {
+        duplicate = true;
+        return prev;
+      }
+      return [{
+        phrase: phrase,
+        translation: translation || '',
+        context: '',
+        category: '',
+        source: 'manual',
+        selected: true
+      }].concat(prev);
+    });
+    if (duplicate) pushToast('info', 'That phrase is already in the list.');
+  }, [pushToast]);
+
+  const addSelectedPhrases = useCallback(async () => {
+    const chosen = suggestItems.filter(it => it.selected);
+    if (!chosen.length || !client) return;
+
+    setSuggestBusy(true);
+    setSuggestNote('Saving to your vocabulary…');
+    try {
+      const known = await fetchKnownPhrases();
+      const knownKeys = new Set(known.map(normalizeText));
+
+      const rows = chosen
+        .filter(it => !knownKeys.has(normalizeText(it.phrase)))
+        .map(it => ({
+          user_id: DEFAULT_USER,
+          phrase: it.phrase,
+          translation: it.translation || null,
+          correction_context: it.context || null,
+          times_reviewed: 0,
+          status: 'learning'
+        }));
+
+      const skipped = chosen.length - rows.length;
+
+      if (rows.length) {
+        const ins = await client.from('target_vocabulary').insert(rows);
+        if (ins.error) throw new Error(ins.error.message);
+      }
+
+      setSuggestOpen(false);
+      setSuggestItems([]);
+      setSuggestNote('');
+
+      if (rows.length) {
+        pushToast('success', 'Added ' + rows.length + ' phrase' + (rows.length === 1 ? '' : 's') +
+          (skipped ? ' · ' + skipped + ' already saved' : '') + '.');
+      } else {
+        pushToast('info', 'Those phrases are already in your vocabulary.');
+      }
+
+      const refreshed = await refreshVocab(client);
+      await Promise.all([refreshStats(client), refreshRecommendedTopic(client, refreshed)]);
+    } catch (err) {
+      console.error(err);
+      setSuggestNote('');
+      pushToast('error', 'Could not save phrases: ' + (err.message || String(err)));
+    } finally {
+      setSuggestBusy(false);
+    }
+  }, [suggestItems, client, fetchKnownPhrases, pushToast, refreshVocab, refreshStats, refreshRecommendedTopic]);
+
+  /* --------------------------------------------------------- vocab export */
+
+  const openExport = useCallback(() => {
+    if (!vocab.length) {
+      pushToast('info', 'No active phrases to export yet.');
+      return;
+    }
+    setExportNote('');
+    setExportOpen(true);
+  }, [vocab.length, pushToast]);
+
+  const runExport = useCallback(async (format, withTurkish) => {
+    if (!vocab.length) return;
+
+    setExportBusy(true);
+    let rows = vocab.map(v => ({
+      id: v.id,
+      phrase: v.phrase,
+      translation: v.translation,
+      correction_context: v.correction_context,
+      times_reviewed: v.times_reviewed,
+      status: v.status,
+      created_at: v.created_at,
+      turkish: ''
+    }));
+
+    try {
+      if (withTurkish) {
+        const cache = turkishCacheRef.current;
+        rows.forEach(r => {
+          const hit = cache.get(r.phrase);
+          if (hit) r.turkish = hit;
+        });
+
+        const missing = rows.filter(r => !r.turkish);
+        if (missing.length) {
+          setExportNote('Translating ' + missing.length + ' phrase' + (missing.length === 1 ? '' : 's') + ' into Turkish…');
+          const translations = await translateToTurkish(config.openaiKey, missing, profile.target_language);
+          missing.forEach((r, i) => {
+            const tr = translations[i] || '';
+            r.turkish = tr;
+            if (tr) cache.set(r.phrase, tr);
+          });
+        }
+      }
+
+      setExportNote('Building the file…');
+      const stamp = new Date().toISOString().slice(0, 10);
+      const langSlug = profile.target_language.toLowerCase().replace(/[^a-z0-9]+/g, '-');
+      const base = 'fluent-loop-vocab-' + langSlug + '-' + stamp;
+
+      if (format === 'csv') {
+        downloadFile(base + '.csv', 'text/csv', buildVocabCsv(rows, profile.target_language, withTurkish));
+      } else {
+        downloadFile(base + '.txt', 'text/plain', buildVocabText(rows, profile.target_language, withTurkish));
+      }
+
+      setExportNote('Downloaded ' + base + '.' + format);
+      pushToast('success', 'Exported ' + rows.length + ' phrase' + (rows.length === 1 ? '' : 's') + ' as .' + format + '.');
+      setExportOpen(false);
+    } catch (err) {
+      console.error(err);
+      setExportNote('');
+      pushToast('error', 'Export failed: ' + (err.message || String(err)));
+    } finally {
+      setExportBusy(false);
+    }
+  }, [vocab, config, profile, pushToast]);
+
+  /* ------------------------------------------------------------- settings */
+
+  const handleSetupSaved = useCallback(async (cfg, db, savedProfile) => {
+    setConfig(cfg);
+    setClient(db);
+    setProfile(savedProfile);
+    setScreen('dashboard');
+    const rows = await refreshVocab(db);
+    await Promise.all([refreshStats(db), refreshRecommendedTopic(db, rows)]);
+  }, [refreshVocab, refreshStats, refreshRecommendedTopic]);
+
+  /* ---------------------------------------------------------------- render */
+
+  if (screen === 'loading') {
+    return (
+      <div className="flex h-full items-center justify-center text-gray-400">
+        <Spinner className="h-6 w-6" />
+      </div>
+    );
+  }
+
+  if (screen === 'setup' || screen === 'settings') {
+    const initial = {
+      openaiKey: config ? config.openaiKey : '',
+      supabaseUrl: config ? config.supabaseUrl : '',
+      supabaseKey: config ? config.supabaseKey : '',
+      voice: config && config.voice ? config.voice : 'alloy',
+      target_language: profile ? profile.target_language : 'German',
+      current_cefr: profile ? profile.current_cefr : 'B1',
+      vocab_injection_mode: profile ? profile.vocab_injection_mode : 'adapt_naturally'
+    };
+    return (
+      <React.Fragment>
+        <Toast toast={toast} onDismiss={dismissToast} />
+        <SetupScreen
+          initial={initial}
+          onSaved={handleSetupSaved}
+          onCancel={screen === 'settings' && profile ? () => setScreen('dashboard') : null}
+          pushToast={pushToast}
+        />
+      </React.Fragment>
+    );
+  }
+
+  if (!profile) {
+    return (
+      <div className="flex h-full items-center justify-center text-gray-400">
+        <Spinner className="h-6 w-6" />
+      </div>
+    );
+  }
+
+  return (
+    <React.Fragment>
+      <Toast toast={toast} onDismiss={dismissToast} />
+
+      {screen === 'session' ? (
+        <SessionScreen
+          profile={profile}
+          topic={topic}
+          messages={messages}
+          status={status}
+          secondsLeft={secondsLeft}
+          onToggleMic={toggleMic}
+          onEnd={endSession}
+          micDisabled={micDisabled}
+          vocabCount={sessionVocabRef.current.length}
+          mode={mode}
+          muted={muted}
+          connectionState={connectionState}
+        />
+      ) : (
+        <Dashboard
+          profile={profile}
+          vocab={vocab}
+          vocabLoading={vocabLoading}
+          recommendedTopic={recommended.topic}
+          recommendedSource={recommended.source}
+          stats={stats}
+          onStart={startSession}
+          onOpenSettings={() => setScreen('settings')}
+          onShowLastFeedback={() => setSheetOpen(true)}
+          hasLastFeedback={!!feedback}
+          onExport={openExport}
+          mode={mode}
+          onModeChange={changeMode}
+          onSuggest={openSuggest}
+        />
+      )}
+
+      {suggestOpen && profile ? (
+        <SuggestSheet
+          targetLanguage={profile.target_language}
+          cefr={profile.current_cefr}
+          items={suggestItems}
+          busy={suggestBusy}
+          note={suggestNote}
+          onGenerate={generateSuggestions}
+          onAdd={addSelectedPhrases}
+          onToggle={toggleSuggestion}
+          onAddManual={addManualPhrase}
+          onClose={() => setSuggestOpen(false)}
+        />
+      ) : null}
+
+      {exportOpen && profile ? (
+        <ExportSheet
+          vocab={vocab}
+          targetLanguage={profile.target_language}
+          defaultTurkish={profile.target_language !== 'Turkish'}
+          busy={exportBusy}
+          note={exportNote}
+          onExport={runExport}
+          onClose={() => setExportOpen(false)}
+        />
+      ) : null}
+
+      {sheetOpen && feedback ? (
+        <FeedbackSheet
+          feedback={feedback}
+          saving={savingFeedback}
+          saveNote={saveNote}
+          onClose={() => setSheetOpen(false)}
+        />
+      ) : null}
+    </React.Fragment>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>
