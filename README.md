@@ -168,7 +168,7 @@ On first run the app asks for:
 
 Settings (the gear icon) reopens this screen later, and carries a **Reset this workspace** action at the bottom. It erases the vocabulary, flashcards, review history, sessions and island roadmap for the profile and language you currently have selected — and nothing else. Your other profiles, your other languages, and your level and injection mode all survive it. It asks twice, and shows you what is about to go.
 
-**OpenAI balance** also lives in Settings. OpenAI offers no API for reading your remaining credit, so the app keeps its own ledger: you type in what your billing page shows once, and every call the app makes is priced from the usage OpenAI reports back — tokens for `gpt-4o` and `gpt-realtime` (cached tokens at the cached rate), audio minutes for `whisper-1`, characters for `tts-1` — and subtracted. It shows *≈ $X left* with a breakdown, turns amber under $2 and red under $0.50, and links straight to OpenAI's billing page for the exact figure. It is an estimate by design: it counts only this app on this device, at list prices checked on 11 Sep 2026 (see `PRICES` in `index.html` if they change). The exact org-wide alternative — the Costs API — needs an admin key, which has no read-only mode and would sit in a browser that loads third-party scripts, so the app deliberately does not use it.
+**OpenAI balance** also lives in Settings. OpenAI offers no API for reading your remaining credit, so the app keeps its own ledger: you type in what your billing page shows once, and every call the app makes is priced from the usage OpenAI reports back — tokens for `gpt-4o` and `gpt-realtime` (cached tokens at the cached rate), tokens for `gpt-4o-transcribe` (or minutes if it falls back to `whisper-1`), characters for `tts-1` — and subtracted. It shows *≈ $X left* with a breakdown, turns amber under $2 and red under $0.50, and links straight to OpenAI's billing page for the exact figure. It is an estimate by design: it counts only this app on this device, at list prices checked on 11 Sep 2026 (see `PRICES` in `index.html` if they change). The exact org-wide alternative — the Costs API — needs an admin key, which has no read-only mode and would sit in a browser that loads third-party scripts, so the app deliberately does not use it.
 
 **Test & Save** verifies the OpenAI key, probes the Supabase tables and writes your profile before letting you through. Everything is stored under the `fluentloop.config.v1` key in `localStorage` — nothing is sent anywhere else.
 
@@ -287,6 +287,16 @@ Under the hood every row carries `target_language`, and every read and write is 
 
 Pick a topic (recommended, or your own) and talk for thirty minutes. The countdown is visible, and hitting `00:00` triggers the analysis automatically. You can end early with **End & Analyze** at any point.
 
+### Your mistakes stay in the transcript
+
+Feedback can only catch mistakes the transcriber leaves in, and speech recognisers are trained to produce clean text — `whisper-1` in particular quietly repairs non-native grammar, so *"Gestern ich habe nach Hause gegangen"* could reach the analysis as the correct *"Gestern bin ich nach Hause gegangen"* and never be flagged.
+
+So transcription uses **`gpt-4o-transcribe`**, which follows written instructions, with a **verbatim prompt** in both modes: write exactly what was said, keep every wrong ending, article, gender and word order, keep fillers and false starts, and leave words said in another language untranslated (which is what lets *word gaps* spot them). The analysis is told the transcript is verbatim, so a wrong form counts as a real mistake while fillers never count as grammar errors. Phrase matching looks past fillers, so *"our project, uh, focuses on"* still counts.
+
+No recogniser can guarantee a perfectly verbatim transcript, so **Settings has a transcription check**: read a sentence that contains a deliberate, typical mistake for your language, and the app transcribes that one recording both ways — the old plain `whisper-1` and the verbatim setup — marking each *mistake kept* or *corrected away*. It costs well under a cent and settles the question on your own voice.
+
+If an account can't use `gpt-4o-transcribe`, sessions fall back to `whisper-1` on their own — in live mode too, where an unusable transcriber would otherwise leave the call with no transcript at all.
+
 ### Speaking at your level
 
 The CEFR level you set for a language decides how your partner talks, in both modes. Each level has a concrete spec rather than an adjective — sentence and turn length, grammar, vocabulary band, the kind of questions asked, and what to do when you don't understand — and only your level's spec goes into the prompt:
@@ -313,7 +323,7 @@ It also knows you. After every session the analysis stores a short summary of wh
 Tap the big button to record, tap again to send.
 
 ```
-MediaRecorder (webm/opus) → whisper-1 → gpt-4o → tts-1 → playback
+MediaRecorder (webm/opus) → gpt-4o-transcribe (verbatim) → gpt-4o → tts-1 → playback
 ```
 
 Tapping the button while your partner is talking stops the audio immediately and starts recording you instead.
@@ -396,7 +406,7 @@ Adapt Naturally sounds like a real conversation. Force Verbatim is better when y
 
 - **Single file.** All markup, styles, components and API plumbing live in `index.html`.
 - **Babel is pinned to `7.26.4`.** Unpinned `@babel/standalone` now resolves to v8, which defaults JSX to the automatic runtime and emits an `import` statement — that breaks an in-browser transform with `Cannot use import statement outside a module`.
-- **Models:** `whisper-1`, `gpt-4o`, `tts-1`, `gpt-realtime`.
+- **Models:** `gpt-4o-transcribe` (with `whisper-1` as fallback), `gpt-4o`, `tts-1`, `gpt-realtime`.
 - **Mobile-first dark UI**, built with the Tailwind CDN build.
 - **Logo** lives in `assets/`: `logo.svg` (the mark, inheriting `currentColor`), `logo-tile.svg` (the app icon on
   indigo), and `logo-wordmark.svg` (horizontal lockup). The favicon is the same mark inlined as a data URI, so the

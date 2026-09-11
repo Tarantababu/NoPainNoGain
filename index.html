@@ -327,10 +327,19 @@ function wordWasUsed(word, haystack, language) {
   });
 }
 
+// Verbatim transcripts keep hesitations, which would otherwise break a phrase
+// in two: "our project, uh, focuses on". Only unambiguous fillers are dropped,
+// and only for matching; "um" (German "around") and "er" ("he") are words.
+const FILLER_TOKENS = new Set(['uh', 'uhh', 'uhm', 'uhmm', 'umm', 'ahm', 'ah', 'ahh', 'ehm', 'erm', 'hmm', 'hm', 'mhm', 'mm', 'eh', 'ehh']);
+
+function withoutFillers(normalized) {
+  return normalized.split(' ').filter(t => t && !FILLER_TOKENS.has(t)).join(' ');
+}
+
 function phraseWasUsed(phrase, haystack, kind, language) {
   if (kind === 'word') return wordWasUsed(phrase, haystack, language);
   const p = normalizeText(phrase);
-  const h = normalizeText(haystack);
+  const h = withoutFillers(normalizeText(haystack));
   if (!p || !h) return false;
   if (h.includes(p)) return true;
 
@@ -453,7 +462,8 @@ const PRICES = {
   realtime: {                                                   // gpt-realtime, per 1M tokens
     textIn: 4, audioIn: 32, cachedIn: 0.4, textOut: 16, audioOut: 64
   },
-  whisperPerMinute: 0.006,                                      // whisper-1
+  whisperPerMinute: 0.006,                                      // whisper-1 (fallback)
+  transcribe: { input: 2.5, output: 10 },                      // gpt-4o-transcribe, per 1M tokens
   ttsPerMillionChars: 15                                        // tts-1
 };
 const SPEND_KEY = 'fluentloop.spend.v1';
@@ -527,6 +537,18 @@ function costOfTranscription(seconds) {
   return Math.max(0, seconds || 0) / 60 * PRICES.whisperPerMinute;
 }
 
+// Transcription bills either by tokens (gpt-4o-transcribe) or by duration
+// (whisper-1), and says which in the usage it returns. With no usage at all,
+// the measured recording length at the per-minute rate is the estimate.
+function costOfTranscriptionUsage(usage, fallbackSeconds) {
+  if (usage && usage.type === 'tokens') {
+    return ((usage.input_tokens || 0) * PRICES.transcribe.input +
+      (usage.output_tokens || 0) * PRICES.transcribe.output) / 1e6;
+  }
+  if (usage && usage.type === 'duration') return costOfTranscription(usage.seconds);
+  return costOfTranscription(fallbackSeconds);
+}
+
 function costOfSpeech(text) {
   return String(text || '').length / 1e6 * PRICES.ttsPerMillionChars;
 }
@@ -544,23 +566,61 @@ async function openaiError(res) {
   return new Error('OpenAI ' + res.status + ': ' + (detail || res.statusText));
 }
 
-async function transcribeAudio(apiKey, blob, language, durationSec) {
-  const ext = extensionForMime(blob.type);
-  const form = new FormData();
-  form.append('file', blob, 'speech.' + ext);
-  form.append('model', 'whisper-1');
-  form.append('language', langCode(language));
-  form.append('temperature', '0');
+/* ------------------------------------------------------- verbatim transcription */
 
-  const res = await fetch('https://api.openai.com/v1/audio/transcriptions', {
-    method: 'POST',
-    headers: { 'Authorization': 'Bearer ' + apiKey },
-    body: form
-  });
+// The analysis can only catch mistakes the transcriber leaves in. Speech
+// recognisers are trained to produce clean text, and whisper-1 in particular
+// quietly repairs non-native grammar. gpt-4o-transcribe follows written
+// instructions, so it is told to keep the learner's speech exactly as said.
+// whisper-1 stays as a fallback if the newer model is unavailable.
+const TRANSCRIBE_MODEL = 'gpt-4o-transcribe';
+const TRANSCRIBE_FALLBACK = 'whisper-1';
+
+function verbatimPrompt(language, level) {
+  return [
+    'Verbatim transcript of a ' + (level || '') + ' learner of ' + language + ' speaking.',
+    'Write exactly what the speaker says, word for word. Keep every mistake as spoken: wrong verb forms and ' +
+      'endings, wrong articles and genders, wrong word order, wrong or invented words. Do not correct, improve, ' +
+      'complete or tidy anything.',
+    'Keep filler words, false starts, repetitions and self-corrections.',
+    'If the speaker says a word in another language, write that word in the language it was said in; do not ' +
+      'translate it.'
+  ].join(' ');
+}
+
+// opts.model / opts.verbatim exist for the transcription check, which runs the
+// old and new setups side by side on the same recording.
+async function transcribeAudio(apiKey, blob, language, durationSec, level, opts) {
+  const model = (opts && opts.model) || TRANSCRIBE_MODEL;
+  const verbatim = !(opts && opts.verbatim === false);
+
+  const send = async (useModel) => {
+    const form = new FormData();
+    form.append('file', blob, 'speech.' + extensionForMime(blob.type));
+    form.append('model', useModel);
+    form.append('language', langCode(language));
+    form.append('temperature', '0');
+    if (verbatim) form.append('prompt', verbatimPrompt(language, level));
+    return fetch('https://api.openai.com/v1/audio/transcriptions', {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + apiKey },
+      body: form
+    });
+  };
+
+  let used = model;
+  let res = await send(model);
+  // An account without access to the newer model still gets a transcript.
+  if (!res.ok && model !== TRANSCRIBE_FALLBACK && (res.status === 400 || res.status === 403 || res.status === 404)) {
+    console.warn(model + ' unavailable (' + res.status + '), falling back to ' + TRANSCRIBE_FALLBACK);
+    used = TRANSCRIBE_FALLBACK;
+    res = await send(TRANSCRIBE_FALLBACK);
+  }
   if (!res.ok) throw await openaiError(res);
   const data = await res.json();
-  recordSpend('transcription', costOfTranscription(durationSec));
-  return (data.text || '').trim();
+  recordSpend('transcription', costOfTranscriptionUsage(data.usage, durationSec));
+  const text = (data.text || '').trim();
+  return (opts && opts.detailed) ? { text: text, model: used } : text;
 }
 
 async function chatCompletion(apiKey, messages, options) {
@@ -642,7 +702,11 @@ function buildRealtimeSession(profile, topic, vocab, voice, stage, memory) {
     output_modalities: ['audio'],
     audio: {
       input: {
-        transcription: { model: 'whisper-1', language: langCode(profile.target_language) },
+        transcription: {
+          model: TRANSCRIBE_MODEL,
+          language: langCode(profile.target_language),
+          prompt: verbatimPrompt(profile.target_language, profile.current_cefr)
+        },
         noise_reduction: { type: 'near_field' },
         turn_detection: {
           type: 'server_vad',
@@ -1646,8 +1710,11 @@ function buildAnalysisPrompt(profile, topic, transcript, activeVocab, stage) {
   return [
     'You are a strict but encouraging ' + profile.target_language + ' teacher analysing a spoken practice session.',
     'The learner is at CEFR level ' + profile.current_cefr + '. The topic was: ' + topic + '.',
-    'The learner turns come from speech-to-text, so ignore pure punctuation and capitalisation artefacts and ignore ' +
-      'obvious transcription noise. Judge grammar, word choice, word order and register only.',
+    'The learner turns are a VERBATIM speech-to-text transcript: the transcriber was told not to correct anything, ' +
+      'so a wrong form in the transcript is what the learner actually said and counts as a real mistake. Fillers, ' +
+      'false starts and repetitions are kept too: never list those as grammar mistakes, though you may mention ' +
+      'hesitation in "cefr_level_feedback". Ignore punctuation and capitalisation, which the transcriber adds. ' +
+      'Judge grammar, word choice, word order and register.',
     '',
     'TRANSCRIPT:',
     lines,
@@ -1715,8 +1782,9 @@ function buildAnalysisPrompt(profile, topic, transcript, activeVocab, stage) {
         '\nFor each check return its id, "met" true only if the learner\'s own words in THIS transcript show it, ' +
         'and "evidence": a short verbatim quote of those words. If it is not met, "evidence" is "" and "missing" is ' +
         'one short, encouraging sentence on what they still need to say. Judge content only: do not fail a check ' +
-        'for being long, hesitant, imperfect or wordy, since grammar is covered elsewhere and fillers are removed ' +
-        'from the transcript. Set "stage_goal_met" true only if every check is met, and "stage_evidence" to "".'
+        'for being long, hesitant, imperfect or wordy: the transcript is verbatim, so fillers and false starts are ' +
+        'there on purpose, and grammar is covered elsewhere. Set "stage_goal_met" true only if every check is met, ' +
+        'and "stage_evidence" to "".'
       : null,
     (stage && !(Array.isArray(stage.checks) && stage.checks.length)) ?
       '- "stage_checks": []. And for "stage_goal_met" and "stage_evidence": this session was part of a language island. The stage objective ' +
@@ -2244,6 +2312,143 @@ function formatUsd(v) {
   return (n < 0 ? '-$' : '$') + Math.abs(n).toFixed(2);
 }
 
+// A sentence with one deliberate, typical learner mistake per language, and the
+// wrong fragment that only survives if the transcriber did not "fix" it.
+const TRANSCRIPTION_TESTS = {
+  English:    { say: 'Yesterday I go to the office and I buyed a coffee.', marker: 'buyed', fix: 'bought' },
+  German:     { say: 'Gestern ich habe nach Hause gegangen.', marker: 'habe', fix: 'bin ich … gegangen' },
+  Spanish:    { say: 'Ayer yo soy muy cansado después del trabajo.', marker: 'soy', fix: 'estaba' },
+  French:     { say: "Hier j'ai allé au marché avec ma mère.", marker: 'ai alle', fix: 'je suis allé' },
+  Italian:    { say: 'Ieri ho andato al mercato con mia madre.', marker: 'ho andato', fix: 'sono andato' },
+  Portuguese: { say: 'Ontem eu fazi o jantar para a minha família.', marker: 'fazi', fix: 'fiz' },
+  Dutch:      { say: 'Gisteren ik heb naar huis gegaan.', marker: 'heb', fix: 'ben ik … gegaan' },
+  Swedish:    { say: 'Igår jag gick till affären.', marker: 'igar jag', fix: 'igår gick jag' },
+  Turkish:    { say: 'Dün okula gidiyorum ve arkadaşımı görüyorum.', marker: 'gidiyorum', fix: 'gittim' },
+  Russian:    { say: 'Вчера я пойду в магазин.', marker: 'пойду', fix: 'пошёл' }
+};
+
+function mistakeKept(transcript, marker) {
+  return (' ' + normalizeText(transcript) + ' ').indexOf(' ' + normalizeText(marker) + ' ') !== -1;
+}
+
+function TranscriptionCheck({ apiKey, language, level }) {
+  const test = TRANSCRIPTION_TESTS[language] || null;
+  const [phase, setPhase] = useState('idle'); // idle | recording | working | done | error
+  const [results, setResults] = useState(null);
+  const [error, setError] = useState('');
+  const recRef = useRef(null);
+  const startRef = useRef(0);
+
+  async function start() {
+    setError('');
+    setResults(null);
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const mime = pickRecorderMime();
+      const rec = mime ? new MediaRecorder(stream, { mimeType: mime }) : new MediaRecorder(stream);
+      const chunks = [];
+      rec.ondataavailable = e => { if (e.data && e.data.size) chunks.push(e.data); };
+      rec.onstop = async () => {
+        stream.getTracks().forEach(t => t.stop());
+        const seconds = (Date.now() - startRef.current) / 1000;
+        const blob = new Blob(chunks, { type: rec.mimeType || mime || 'audio/webm' });
+        setPhase('working');
+        try {
+          // Same recording, both setups, so the only difference is the transcriber.
+          const [before, now] = await Promise.all([
+            transcribeAudio(apiKey, blob, language, seconds, level,
+              { model: TRANSCRIBE_FALLBACK, verbatim: false, detailed: true }),
+            transcribeAudio(apiKey, blob, language, seconds, level, { detailed: true })
+          ]);
+          setResults({ before: before, now: now });
+          setPhase('done');
+        } catch (err) {
+          setError(err.message || String(err));
+          setPhase('error');
+        }
+      };
+      recRef.current = rec;
+      rec.start();
+      startRef.current = Date.now();
+      setPhase('recording');
+    } catch (err) {
+      setError(err && err.name === 'NotAllowedError' ? 'Microphone access was denied.' : (err.message || String(err)));
+      setPhase('error');
+    }
+  }
+
+  function stop() {
+    if (recRef.current && recRef.current.state !== 'inactive') recRef.current.stop();
+  }
+
+  const row = (label, r) => {
+    const kept = test ? mistakeKept(r.text, test.marker) : null;
+    return (
+      <div className="rounded-lg border border-gray-800 bg-gray-900/60 p-3">
+        <div className="flex items-center justify-between text-[11px] font-semibold uppercase tracking-wide text-gray-500">
+          <span>{label} · {r.model}</span>
+          {kept === null ? null : kept
+            ? <span className="text-emerald-300">mistake kept</span>
+            : <span className="text-red-300">corrected away</span>}
+        </div>
+        <div className="mt-1 text-sm text-gray-200">{r.text || '—'}</div>
+      </div>
+    );
+  };
+
+  return (
+    <div className="mt-8 rounded-2xl border border-gray-800 bg-gray-800/40 p-4">
+      <h2 className="text-sm font-semibold text-gray-200">Transcription check</h2>
+      <p className="mt-1 text-xs leading-relaxed text-gray-400">
+        Your feedback can only catch mistakes the transcriber leaves in. Read this sentence aloud — the mistake is on
+        purpose — and see whether it survives.
+      </p>
+
+      <div className="mt-3 rounded-lg border border-indigo-500/30 bg-indigo-500/10 p-3">
+        {test ? (
+          <React.Fragment>
+            <div className="text-sm text-white">“{test.say}”</div>
+            <div className="mt-1 text-[11px] text-gray-400">
+              The mistake: <span className="text-amber-300">{test.marker}</span> (correct: {test.fix})
+            </div>
+          </React.Fragment>
+        ) : (
+          <div className="text-sm text-gray-300">
+            Say a short {language} sentence with a mistake you often make, then compare the two transcripts.
+          </div>
+        )}
+      </div>
+
+      {phase === 'recording' ? (
+        <button type="button" onClick={stop}
+          className="no-tap rec-pulse mt-3 w-full rounded-xl bg-red-600 px-4 py-2.5 text-sm font-semibold text-white">
+          Stop and compare
+        </button>
+      ) : (
+        <button type="button" onClick={start} disabled={phase === 'working' || !apiKey}
+          className="no-tap mt-3 flex w-full items-center justify-center gap-2 rounded-xl border border-gray-700 px-4 py-2.5 text-sm text-gray-200 transition hover:text-white disabled:opacity-50">
+          {phase === 'working' ? <Spinner className="h-4 w-4" /> : null}
+          {phase === 'working' ? 'Transcribing both ways…' : phase === 'done' ? 'Try again' : 'Record the sentence'}
+        </button>
+      )}
+
+      {results ? (
+        <div className="mt-3 space-y-2">
+          {row('Before', results.before)}
+          {row('Now', results.now)}
+          {results.now.model !== TRANSCRIBE_MODEL ? (
+            <p className="text-xs text-amber-300">
+              Your account could not use {TRANSCRIBE_MODEL}, so sessions fall back to {TRANSCRIBE_FALLBACK}.
+            </p>
+          ) : null}
+        </div>
+      ) : null}
+      {error ? <p className="mt-2 text-xs text-red-300">{error}</p> : null}
+      <p className="mt-2 text-[11px] text-gray-600">Two short transcriptions, well under a cent.</p>
+    </div>
+  );
+}
+
 function BalanceCard() {
   const [ledger, setLedger] = useState(loadSpend);
   const [editing, setEditing] = useState(false);
@@ -2556,6 +2761,10 @@ function SetupScreen({ initial, onSaved, onCancel, pushToast, learnerId, resetIn
       </form>
 
       {resetInfo ? <BalanceCard /> : null}
+
+      {resetInfo && resetInfo.check ? (
+        <TranscriptionCheck apiKey={resetInfo.check.apiKey} language={resetInfo.check.language} level={resetInfo.check.level} />
+      ) : null}
 
       {resetInfo ? (
         <div className="mt-8 rounded-2xl border border-red-500/30 bg-red-500/5 p-4">
@@ -4626,6 +4835,7 @@ function App() {
   const realtimeRef = useRef(null);
   const realtimeDcRef = useRef(null);
   const realtimeItemsRef = useRef([]);
+  const transcriberFallbackRef = useRef(false);
   const modeRef = useRef(MODE_TURN);
   const languageRef = useRef('German');
   const learnerRef = useRef(DEFAULT_USER);
@@ -5370,10 +5580,8 @@ function App() {
 
       case 'conversation.item.input_audio_transcription.completed':
         upsertRealtimeItem(event.item_id, 'user', event.transcript || '');
-        // whisper-1 inside a realtime session reports its bill as a duration.
-        if (event.usage && event.usage.type === 'duration') {
-          recordSpend('transcription', costOfTranscription(event.usage.seconds));
-        }
+        // The session's transcriber reports its own bill, as tokens or as a duration.
+        if (event.usage) recordSpend('transcription', costOfTranscriptionUsage(event.usage, 0));
         break;
 
       case 'conversation.item.input_audio_transcription.failed':
@@ -5406,6 +5614,26 @@ function App() {
       case 'error': {
         const msg = event.error && event.error.message ? event.error.message : 'Realtime error.';
         console.error('Realtime error', event);
+        // If the call cannot use the verbatim transcriber, it would carry on
+        // with no transcript at all and leave nothing to analyse. Drop back to
+        // whisper-1 once, keeping the call alive.
+        const dc = realtimeDcRef.current;
+        if (dc && !transcriberFallbackRef.current && /transcri|gpt-4o-transcribe/i.test(msg)) {
+          transcriberFallbackRef.current = true;
+          try {
+            dc.send(JSON.stringify({
+              type: 'session.update',
+              session: {
+                type: 'realtime',
+                audio: { input: { transcription: {
+                  model: TRANSCRIBE_FALLBACK, language: langCode(languageRef.current)
+                } } }
+              }
+            }));
+            console.warn('Realtime transcription fell back to ' + TRANSCRIBE_FALLBACK);
+          } catch (e) { /* the toast below still tells the learner */ }
+          break;
+        }
         pushToast('error', msg);
         break;
       }
@@ -5495,6 +5723,7 @@ function App() {
       ? Object.assign({}, currentStage, focus ? { focus: stageGate(currentStage, allVocab) } : {})
       : null;
     realtimeItemsRef.current = [];
+    transcriberFallbackRef.current = false;
     setConnectionState('');
     setMuted(false);
     setScreen('session');
@@ -5561,7 +5790,7 @@ function App() {
 
     setStatus('transcribing');
     try {
-      const text = await transcribeAudio(config.openaiKey, blob, profile.target_language, seconds);
+      const text = await transcribeAudio(config.openaiKey, blob, profile.target_language, seconds, profile.current_cefr);
       if (!text) {
         setStatus('idle');
         pushToast('info', 'Nothing was picked up. Try again a bit closer to the mic.');
@@ -6503,7 +6732,10 @@ function App() {
             stages: stages.length,
             total: allVocab.length + stats.sessions + srsSets.length + stages.length,
             busy: resetBusy,
-            onReset: resetWorkspace
+            onReset: resetWorkspace,
+            check: config && config.openaiKey
+              ? { apiKey: config.openaiKey, language: profile.target_language, level: profile.current_cefr }
+              : null
           } : null}
           onSaved={handleSetupSaved}
           onCancel={screen === 'settings' && profile ? () => setScreen('dashboard') : null}
