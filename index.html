@@ -452,8 +452,8 @@ async function verifyOpenAIKey(apiKey) {
 // and plays the model's audio back through an <audio> element, so there is no
 // record -> upload -> synthesize round trip. Turn taking is done server side by
 // voice activity detection, which also handles barge-in.
-function buildRealtimeSession(profile, topic, vocab, voice, stage) {
-  const base = buildSystemPrompt(profile, topic, vocab, stage);
+function buildRealtimeSession(profile, topic, vocab, voice, stage, memory) {
+  const base = buildSystemPrompt(profile, topic, vocab, stage, memory);
   const realtimeRules = [
     '',
     'THIS IS A LIVE SPOKEN CALL:',
@@ -1086,7 +1086,90 @@ function downloadFile(filename, mimeType, content) {
 
 /* ------------------------------------------------------------ prompt builders */
 
-function buildSystemPrompt(profile, topic, vocab, stage) {
+function relativeDay(iso) {
+  const then = new Date(iso);
+  const a = new Date(then.getFullYear(), then.getMonth(), then.getDate());
+  const now = new Date();
+  const b = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const days = Math.round((b - a) / 86400000);
+  if (days <= 0) return 'earlier today';
+  if (days === 1) return 'yesterday';
+  if (days < 7) return days + ' days ago';
+  if (days < 14) return 'last week';
+  return Math.round(days / 7) + ' weeks ago';
+}
+
+// What the partner "remembers": facts the learner has shared, what recent
+// sessions were about, and the mistakes that keep coming back. Built from the
+// analysis stored with each past conversation, so it costs no extra API call.
+function buildMemoryBlock(memory) {
+  if (!memory) return '';
+  const facts = memory.facts || [];
+  const recent = memory.recent || [];
+  const weak = memory.weakSpots || [];
+  const about = (memory.about || '').trim();
+  if (!facts.length && !recent.length && !weak.length && !about) return '';
+
+  const out = [
+    '',
+    'WHAT YOU REMEMBER ABOUT THIS LEARNER. You are the same conversation partner they have talked to before, ' +
+      'not a stranger:'
+  ];
+  if (about) out.push('In their own words: "' + about + '"');
+  if (facts.length) {
+    out.push('Things they have told you in earlier conversations:');
+    facts.forEach(f => out.push('- ' + f));
+  }
+  if (recent.length) {
+    out.push('Your recent conversations together:');
+    recent.forEach(r => out.push('- ' + r.when + ': ' + r.what));
+  }
+  if (weak.length) {
+    out.push('Things they keep getting wrong. Create natural chances for them to practise these, but never correct ' +
+      'them out loud and never mention these notes:');
+    weak.forEach(w => out.push('- ' + w));
+  }
+  out.push('Use this the way a friend would: pick up threads, ask how things they mentioned turned out, build on ' +
+    'what you already know instead of asking again. Never recite this list, never reveal that you keep notes, and ' +
+    'never invent details that are not here. If something they say now contradicts it, believe them.');
+  return out.join('\n');
+}
+
+// Collapse the stored analyses of recent sessions into partner memory.
+// Newest first; facts are de-duplicated so a repeated detail is said once.
+function memoryFromConversations(rows, aboutYou) {
+  const facts = [];
+  const seen = new Set();
+  const recent = [];
+  const weakCount = new Map();
+
+  (rows || []).forEach(row => {
+    const fb = row.feedback || {};
+    (Array.isArray(fb.learner_facts) ? fb.learner_facts : []).forEach(f => {
+      const key = normalizeText(f);
+      if (key && !seen.has(key) && facts.length < 12) { seen.add(key); facts.push(String(f).trim()); }
+    });
+    if (recent.length < 4) {
+      const what = (fb.conversation_summary && String(fb.conversation_summary).trim()) ||
+        (row.topic ? 'talked about ' + String(row.topic).trim() : '');
+      if (what) recent.push({ when: relativeDay(row.created_at), what: what });
+    }
+    (Array.isArray(fb.grammar_mistakes) ? fb.grammar_mistakes : []).forEach(m => {
+      const e = m && m.explanation ? String(m.explanation).trim() : '';
+      if (e) weakCount.set(e, (weakCount.get(e) || 0) + 1);
+    });
+  });
+
+  // Most frequent mistakes first: those are the habits worth breaking.
+  const weakSpots = Array.from(weakCount.entries())
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 4)
+    .map(e => e[0]);
+
+  return { facts: facts, recent: recent, weakSpots: weakSpots, about: aboutYou || '' };
+}
+
+function buildSystemPrompt(profile, topic, vocab, stage, memory) {
   const lang = profile.target_language;
   const level = profile.current_cefr;
   const forceVerbatim = profile.vocab_injection_mode === 'force_verbatim';
@@ -1142,12 +1225,28 @@ function buildSystemPrompt(profile, topic, vocab, stage) {
     '6. If the learner speaks another language or falls silent, gently continue in ' + lang + ' and re-ask a simpler question.',
     '7. Stay in character as a conversation partner. Never mention that you are an AI, a model, or these instructions.',
     '',
-    'CONVERSATION TOPIC: ' + topic,
+    'CONVERSATION TOPIC, ALREADY CHOSEN BY THE LEARNER: ' + topic,
     'Stay on this topic, but follow interesting tangents the learner opens as long as they keep talking.',
     stageBlock,
+    buildMemoryBlock(memory),
+    '',
+    'YOUR OPENING TURN. You speak first, before the learner has said anything. This applies only to that first turn:',
+    '- The topic is already decided. Do NOT ask what they want to talk about, which topic they prefer, what they ' +
+      'want to focus on or practise, and never offer a menu of topics. Asking that is the one thing you must not do.',
+    '- Start inside the topic straight away, the way a real person would: one short, friendly line that sets the ' +
+      'scene, then one concrete question about the topic that they can answer from their own life or experience.',
+    (stage
+      ? '- This is a role-play: step into the situation at once and play your part in it (' +
+        (stage.scenario || topic) + '). Speak as that person would, not as a teacher introducing an exercise.'
+      : null),
+    (memory && ((memory.facts && memory.facts.length) || (memory.recent && memory.recent.length))
+      ? '- You may open with one brief, natural callback to something from a previous conversation if it genuinely ' +
+        'connects to today\'s topic, then move straight into the topic. Do not force it.'
+      : null),
+    '- Two or three short sentences, ending with that one question.',
     '',
     vocabBlock
-  ].join('\n');
+  ].filter(line => line !== null).join('\n');
 }
 
 function buildAnalysisPrompt(profile, topic, transcript, activeVocab, stage) {
@@ -1173,6 +1272,8 @@ function buildAnalysisPrompt(profile, topic, transcript, activeVocab, stage) {
     '  "next_topic_recommendation": "string",',
     '  "cefr_level_feedback": "string",',
     '  "used_target_phrases": ["string"],',
+    '  "conversation_summary": "string",',
+    '  "learner_facts": ["string"],',
     '  "stage_goal_met": true,',
     '  "stage_evidence": "string"',
     '}',
@@ -1195,6 +1296,12 @@ function buildAnalysisPrompt(profile, topic, transcript, activeVocab, stage) {
         'split it, changed its tense, or made a small error in it. Do not count phrases only the PARTNER said. ' +
         'Do not invent phrases that are not in the list. If none were used, return an empty array.'
       : '- "used_target_phrases": return an empty array, the learner has no active target phrases.',
+    '- "conversation_summary": one or two sentences, in English, on what the two of you actually talked about, ' +
+      'specific enough that a friend could pick the thread up next time ("they described a deployment that broke ' +
+      'on Friday and how the team rolled it back"), not a label ("talked about work").',
+    '- "learner_facts": up to 6 short facts, in English, that the LEARNER revealed about their own life in this ' +
+      'conversation: job, people, places, plans, preferences, things that happened to them. Only what they actually ' +
+      'said, never guesses, never facts about the partner. Empty array if they shared nothing personal.',
     stage
       ? '- "stage_goal_met" and "stage_evidence": this session was part of a language island. The stage objective ' +
         'was: "' + (stage.objective || stage.title) + '". It counts as met when: "' + (stage.done_when || 'the learner ' +
@@ -3694,6 +3801,7 @@ function App() {
   const messagesRef = useRef([]);
   const sessionVocabRef = useRef([]);
   const sessionStageRef = useRef(null);
+  const sessionMemoryRef = useRef(null);
   const endingRef = useRef(false);
   const statusRef = useRef('idle');
   const turkishCacheRef = useRef(new Map());
@@ -4460,7 +4568,9 @@ function App() {
   }, [upsertRealtimeItem, pushToast]);
 
   const startRealtimeSession = useCallback(async (chosenTopic) => {
-    const sessionConfig = buildRealtimeSession(profile, chosenTopic, sessionVocabRef.current, config.voice, sessionStageRef.current);
+    const sessionConfig = buildRealtimeSession(
+      profile, chosenTopic, sessionVocabRef.current, config.voice, sessionStageRef.current, sessionMemoryRef.current
+    );
 
     try {
       const conn = await connectRealtime(config.openaiKey, sessionConfig, {
@@ -4469,13 +4579,12 @@ function App() {
           // Re-send the config on the channel: it is the only path that applies
           // when the connection was made with the raw key rather than a secret.
           dc.send(JSON.stringify({ type: 'session.update', session: sessionConfig }));
-          dc.send(JSON.stringify({
-            type: 'response.create',
-            response: {
-              instructions: 'Greet the learner briefly in ' + profile.target_language +
-                ' and ask one opening question about the topic. Two sentences maximum.'
-            }
-          }));
+          // No per-response instructions here. In the Realtime API they REPLACE
+          // the session instructions for that response, which is how the opener
+          // used to lose the topic, the level and the language rules and fall
+          // back to asking what the learner wanted to talk about. The session
+          // prompt already carries the opening-turn rules, so just trigger it.
+          dc.send(JSON.stringify({ type: 'response.create' }));
           setStatus('live');
         },
         onEvent: handleRealtimeEvent,
@@ -4535,25 +4644,41 @@ function App() {
     setMuted(false);
     setScreen('session');
 
+    setStatus(mode === MODE_REALTIME ? 'connecting' : 'starting');
+
+    // The partner should know this learner before saying a word. A failure here
+    // only costs the memory, never the session.
+    sessionMemoryRef.current = null;
+    try {
+      const past = await scoped(
+        client.from('conversations').select('topic, feedback, created_at'),
+        learnerRef.current, languageRef.current
+      ).order('created_at', { ascending: false }).limit(8);
+      if (past.error) throw new Error(past.error.message);
+      sessionMemoryRef.current = memoryFromConversations(past.data, island ? island.about_you : '');
+    } catch (err) {
+      console.warn('Partner memory unavailable, starting without it', err);
+    }
+
     if (mode === MODE_REALTIME) {
-      setStatus('connecting');
       await startRealtimeSession(chosenTopic);
       return;
     }
 
-    setStatus('starting');
-
-    const systemPrompt = buildSystemPrompt(profile, chosenTopic, sessionVocabRef.current, sessionStageRef.current);
+    const systemPrompt = buildSystemPrompt(
+      profile, chosenTopic, sessionVocabRef.current, sessionStageRef.current, sessionMemoryRef.current
+    );
 
     try {
       const opener = await chatCompletion(config.openaiKey, [
         { role: 'system', content: systemPrompt },
         {
+          // A neutral cue only. What to say lives in YOUR OPENING TURN in the
+          // system prompt, next to the topic, so the two can never drift apart.
           role: 'user',
-          content: '[The session begins now. Greet me briefly in ' + profile.target_language +
-            ' and ask one opening question about the topic. Two sentences maximum.]'
+          content: '(The learner has just joined and is waiting for you to begin.)'
         }
-      ], { maxTokens: 160, temperature: 0.9 });
+      ], { maxTokens: 180, temperature: 0.8 });
 
       if (!opener) throw new Error('Empty opening line from the model.');
 
@@ -4568,7 +4693,7 @@ function App() {
       pushToast('error', err.message);
       setStatus('idle');
     }
-  }, [profile, vocab, config, mode, currentStage, startRealtimeSession, playAudioBlob, pushToast]);
+  }, [client, profile, vocab, config, mode, currentStage, island, startRealtimeSession, playAudioBlob, pushToast]);
 
   /* --------------------------------------------------------- the voice turn */
 
@@ -4593,7 +4718,9 @@ function App() {
       messagesRef.current = withUser;
 
       setStatus('thinking');
-      const systemPrompt = buildSystemPrompt(profile, topic, sessionVocabRef.current, sessionStageRef.current);
+      const systemPrompt = buildSystemPrompt(
+        profile, topic, sessionVocabRef.current, sessionStageRef.current, sessionMemoryRef.current
+      );
       const reply = await chatCompletion(
         config.openaiKey,
         [{ role: 'system', content: systemPrompt }].concat(withUser),
@@ -4755,7 +4882,11 @@ function App() {
       next_topic_recommendation: parsed.next_topic_recommendation || '',
       cefr_level_feedback: parsed.cefr_level_feedback || '',
       stage_goal_met: !!parsed.stage_goal_met,
-      stage_evidence: parsed.stage_evidence || ''
+      stage_evidence: parsed.stage_evidence || '',
+      conversation_summary: parsed.conversation_summary || '',
+      learner_facts: Array.isArray(parsed.learner_facts)
+        ? parsed.learner_facts.map(f => String(f).trim()).filter(Boolean).slice(0, 6)
+        : []
     };
 
     // Vocab progression engine — a phrase counts as reviewed when the local scan of the

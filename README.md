@@ -275,6 +275,12 @@ Under the hood every row carries `target_language`, and every read and write is 
 
 Pick a topic (recommended, or your own) and talk for thirty minutes. The countdown is visible, and hitting `00:00` triggers the analysis automatically. You can end early with **End & Analyze** at any point.
 
+### Your partner remembers you
+
+The partner opens **inside the topic you chose** — a line that sets the scene and one concrete question — and is explicitly forbidden from asking what you want to talk about. On an island stage it steps straight into the role-play.
+
+It also knows you. After every session the analysis stores a short summary of what you talked about and any personal facts you mentioned (your job, people, places, plans). The next session loads the last few for that profile and language, so the partner can pick up threads — *"how did the rollback go?"* — and quietly create chances to practise your most frequent mistakes, without ever correcting you out loud. It is told never to invent details it was not given. Memory is scoped exactly like everything else: one profile, one language.
+
 ### Turn-based mode
 
 Tap the big button to record, tap again to send.
