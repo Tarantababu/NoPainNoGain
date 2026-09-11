@@ -107,6 +107,7 @@
      correction_context text,
      times_reviewed int default 0,
      status text default 'learning', -- 'learning' | 'mastered'
+     kind text not null default 'phrase', -- 'phrase' | 'word' (words in dictionary form)
      created_at timestamp with time zone default now()
    );
 
@@ -252,7 +253,82 @@ function normalizeText(input) {
 // Fuzzy "did the learner actually use this phrase?" check.
 // Exact normalized substring wins; otherwise require most content words present,
 // which tolerates conjugation and case changes in inflected languages.
-function phraseWasUsed(phrase, haystack) {
+// Leading articles (and English "to") belong to a word's dictionary form but
+// must not be demanded when the learner uses the word: "die Quittung" is used
+// just as surely in "eine Quittung". Per language, because the same token can
+// be an article in one language and a real word in another: "a conta" is a
+// Portuguese noun with its article, "a lot" is an English phrase.
+const ARTICLES_BY_LANGUAGE = {
+  German: ['der', 'die', 'das', 'den', 'dem', 'des', 'ein', 'eine', 'einen', 'einem', 'einer', 'eines'],
+  French: ['le', 'la', 'les', 'l', 'un', 'une'],
+  Spanish: ['el', 'la', 'los', 'las', 'un', 'una', 'unos', 'unas'],
+  Italian: ['il', 'lo', 'la', 'i', 'gli', 'le', 'l', 'un', 'uno', 'una'],
+  Portuguese: ['o', 'a', 'os', 'as', 'um', 'uma'],
+  Dutch: ['de', 'het', 'een'],
+  Swedish: ['en', 'ett'],
+  English: ['to']
+};
+const ALL_ARTICLES = new Set([].concat.apply([], Object.values(ARTICLES_BY_LANGUAGE)));
+
+function articlesFor(language) {
+  if (!language) return ALL_ARTICLES;
+  return new Set(ARTICLES_BY_LANGUAGE[language] || []);
+}
+
+function headwordOf(phrase, language) {
+  const t = normalizeText(phrase).split(' ').filter(Boolean);
+  if (t.length === 2 && articlesFor(language).has(t[0])) return t[1];
+  return t.join(' ');
+}
+
+// A single word, once any article is set aside.
+function detectKind(phrase, language) {
+  const head = headwordOf(phrase, language);
+  return head && head.indexOf(' ') === -1 ? 'word' : 'phrase';
+}
+
+// The key two entries are compared on for duplicates. Words compare on their
+// headword, so "Quittung" and "die Quittung" are one entry, not two.
+function vocabKey(phrase, kind, language) {
+  return (kind || detectKind(phrase, language)) === 'word' ? headwordOf(phrase, language) : normalizeText(phrase);
+}
+
+// Infinitive endings a conjugated verb drops: verstehen -> verstehst,
+// hablar -> hablamos. Only used when a real stem of 4+ letters remains.
+const INFINITIVE_ENDINGS = {
+  German: ['en'], Dutch: ['en'],
+  Spanish: ['ar', 'er', 'ir'], Portuguese: ['ar', 'er', 'ir'],
+  French: ['er', 'ir', 're'], Italian: ['are', 'ere', 'ire'],
+  Swedish: ['a']
+};
+
+// Words must appear as a token of their own. Substring matching, which is
+// fine for phrases, would count "Hund" inside "Hundefutter" and "Art" inside
+// "Karte". Two kinds of inflection are accepted:
+//   - the whole word plus a short ending (Quittung -> Quittungen, borrow -> borrowed);
+//   - a verb's stem once its infinitive ending is dropped (verstehen -> verstehe).
+// Sharing a prefix is not enough: "receipt" is not used in "received".
+// Irregular forms (gehen -> ging) are left to the analyser's own verdict.
+function wordWasUsed(word, haystack, language) {
+  const head = headwordOf(word, language);
+  if (!head || head.indexOf(' ') !== -1) return false;
+  const tokens = normalizeText(haystack).split(' ').filter(Boolean);
+
+  let verbStem = '';
+  (INFINITIVE_ENDINGS[language] || []).forEach(e => {
+    if (!verbStem && head.endsWith(e) && head.length - e.length >= 4) verbStem = head.slice(0, head.length - e.length);
+  });
+
+  return tokens.some(tok => {
+    if (tok === head) return true;
+    if (head.length >= 3 && tok.startsWith(head) && tok.length - head.length <= 3) return true;
+    if (verbStem && tok.startsWith(verbStem) && Math.abs(tok.length - head.length) <= 3) return true;
+    return false;
+  });
+}
+
+function phraseWasUsed(phrase, haystack, kind, language) {
+  if (kind === 'word') return wordWasUsed(phrase, haystack, language);
   const p = normalizeText(phrase);
   const h = normalizeText(haystack);
   if (!p || !h) return false;
@@ -658,7 +734,7 @@ async function generateIslandRoadmap(apiKey, profile, islandName, aboutYou, weak
         '      "scenario": "the situation to practise it in, in English, one sentence",',
         '      "structures": ["grammar or patterns to lean on, in English, 1-3 items"],',
         '      "phrases": [',
-        '        { "phrase": "the chunk in ' + profile.target_language + '", "translation": "English", "note": "when to reach for it" }',
+        '        { "phrase": "the chunk in ' + profile.target_language + '", "translation": "English", "note": "when to reach for it", "kind": "phrase" }',
         '      ],',
         '      "done_when": "an observable test the learner passes, in English, one sentence",',
         '      "recycles_from": [1, 2]',
@@ -668,7 +744,11 @@ async function generateIslandRoadmap(apiKey, profile, islandName, aboutYou, weak
         '',
         'Rules:',
         '- EXACTLY ' + ISLAND_STAGES_TARGET + ' stages, positions 1 to ' + ISLAND_STAGES_TARGET + ' in order.',
-        '- 4 to 6 phrases per stage. Phrases are multi-word chunks a native would actually say, never single words.',
+        '- 4 to 6 items per stage. Most are multi-word chunks a native would actually say ("kind": "phrase").',
+        '- A stage may also include AT MOST 2 single key words ("kind": "word"), and only words its situation cannot ' +
+          'be talked about without that a CEFR ' + profile.current_cefr + ' learner may well not know. Give them ' +
+          'in dictionary form: verbs in the infinitive, nouns with their definite article in gendered languages. ' +
+          'Never spend a slot on a word the learner surely knows already.',
         '- "recycles_from" is an array of earlier positions, empty only for position 1.',
         '- "done_when" must be observable from a spoken conversation, not a feeling.',
         '- Output raw JSON only, no markdown fences, no commentary.'
@@ -690,13 +770,22 @@ async function generateIslandRoadmap(apiKey, profile, islandName, aboutYou, weak
       objective: String(st.objective || '').trim(),
       scenario: String(st.scenario || '').trim(),
       structures: Array.isArray(st.structures) ? st.structures.map(String) : [],
-      phrases: (Array.isArray(st.phrases) ? st.phrases : [])
-        .filter(p => p && p.phrase)
-        .map(p => ({
-          phrase: String(p.phrase).trim(),
-          translation: p.translation ? String(p.translation).trim() : '',
-          note: p.note ? String(p.note).trim() : ''
-        })),
+      phrases: (function () {
+        let words = 0;
+        return (Array.isArray(st.phrases) ? st.phrases : [])
+          .filter(p => p && p.phrase)
+          .map(p => {
+            const phrase = String(p.phrase).trim();
+            return {
+              phrase: phrase,
+              // The text decides, not the label: one word is a word.
+              kind: detectKind(phrase, profile.target_language),
+              translation: p.translation ? String(p.translation).trim() : '',
+              note: p.note ? String(p.note).trim() : ''
+            };
+          })
+          .filter(p => p.kind !== 'word' || ++words <= 2);
+      })(),
       done_when: String(st.done_when || '').trim(),
       recycles_from: Array.isArray(st.recycles_from)
         ? st.recycles_from.map(n => parseInt(n, 10)).filter(n => Number.isInteger(n) && n >= 1 && n <= i)
@@ -742,13 +831,15 @@ async function suggestIslands(apiKey, profile, aboutYou) {
 // every phrase it introduced has been genuinely used in conversation.
 function stageGate(stage, vocabRows) {
   const phrases = Array.isArray(stage.phrases) ? stage.phrases : [];
+  const lang = stage.target_language;
   const byPhrase = new Map();
-  (vocabRows || []).forEach(v => byPhrase.set(normalizeText(v.phrase), v));
+  (vocabRows || []).forEach(v => byPhrase.set(vocabKey(v.phrase, v.kind, lang), v));
 
   let mastered = 0;
   const outstanding = [];
   phrases.forEach(p => {
-    const row = byPhrase.get(normalizeText(p.phrase));
+    // A stage word may already be in the list without its article, or with it.
+    const row = byPhrase.get(vocabKey(p.phrase, p.kind, lang));
     if (row && row.status === 'mastered') mastered += 1;
     else outstanding.push({
       phrase: p.phrase,
@@ -920,8 +1011,12 @@ async function suggestStarterPhrases(apiKey, profile, theme, existingPhrases) {
         avoidBlock,
         '',
         'What to propose:',
-        '- Multi-word chunks only: collocations, fixed expressions, sentence starters, connectors, ' +
-          'hedges, reactions and polite formulas. Never isolated single words.',
+        '- Mostly multi-word chunks: collocations, fixed expressions, sentence starters, connectors, ' +
+          'hedges, reactions and polite formulas.',
+        '- You may include AT MOST 2 single words, and only when the theme cannot really be talked about without ' +
+          'them and a CEFR ' + profile.current_cefr + ' learner plausibly does not know them yet. Give those in ' +
+          'dictionary form (infinitive; nouns with their definite article in gendered languages) and set their ' +
+          '"kind" to "word". Everything else has "kind": "phrase".',
         '- Things a native actually says often, not textbook curiosities.',
         '- Pitched at CEFR ' + profile.current_cefr + ': comfortably sayable at that level but a step above ' +
           'what the learner probably reaches for by default.',
@@ -930,7 +1025,7 @@ async function suggestStarterPhrases(apiKey, profile, theme, existingPhrases) {
         'Return ONLY a JSON object of this exact shape:',
         '{',
         '  "phrases": [',
-        '    { "phrase": "string", "translation": "string", "context": "string", "category": "string" }',
+        '    { "phrase": "string", "translation": "string", "context": "string", "category": "string", "kind": "phrase" }',
         '  ]',
         '}',
         '',
@@ -938,7 +1033,8 @@ async function suggestStarterPhrases(apiKey, profile, theme, existingPhrases) {
         '- "phrase" is in ' + profile.target_language + '.',
         '- "translation" is a short, natural English equivalent.',
         '- "context" is one short English sentence saying when to reach for it.',
-        '- "category" is one or two words, such as "opinion", "connector", "small talk", "polite request", "reaction".',
+        '- "category" is one or two words, such as "opinion", "connector", "small talk", "polite request", "reaction", ' +
+          'or "key word" for a single word.',
         '- Output raw JSON only, with no markdown fences and no commentary.'
       ].join('\n')
     }
@@ -948,19 +1044,26 @@ async function suggestStarterPhrases(apiKey, profile, theme, existingPhrases) {
   const parsed = JSON.parse(cleaned);
   const rows = Array.isArray(parsed.phrases) ? parsed.phrases : [];
 
-  const seen = new Set((existingPhrases || []).map(normalizeText));
+  const lang = profile.target_language;
+  const seen = new Set((existingPhrases || []).map(e => vocabKey(e, undefined, lang)));
   const out = [];
+  let wordsTaken = 0;
   rows.forEach(r => {
     if (!r || !r.phrase) return;
     const phrase = String(r.phrase).trim();
-    const key = normalizeText(phrase);
+    // Trust the text over the label: a one-word "phrase" is a word.
+    const kind = detectKind(phrase, lang);
+    if (kind === 'word' && wordsTaken >= 2) return;
+    const key = vocabKey(phrase, kind, lang);
     if (!key || seen.has(key)) return;
     seen.add(key);
+    if (kind === 'word') wordsTaken += 1;
     out.push({
       phrase: phrase,
+      kind: kind,
       translation: r.translation ? String(r.translation).trim() : '',
       context: r.context ? String(r.context).trim() : '',
-      category: r.category ? String(r.category).trim() : '',
+      category: kind === 'word' ? 'key word' : (r.category ? String(r.category).trim() : ''),
       source: 'suggested'
     });
   });
@@ -1177,8 +1280,9 @@ function buildSystemPrompt(profile, topic, vocab, stage, memory) {
   const vocabLines = vocab.map(v => {
     const tr = v.translation ? ' — means: ' + v.translation : '';
     const ctx = v.correction_context ? ' — context: ' + v.correction_context : '';
-    return '- "' + v.phrase + '"' + tr + ctx;
+    return '- ' + (v.kind === 'word' ? 'word ' : '') + '"' + v.phrase + '"' + tr + ctx;
   }).join('\n');
+  const hasWords = vocab.some(v => v.kind === 'word');
 
   const injectionRule = forceVerbatim
     ? 'FORCE VERBATIM MODE: you must use each target phrase EXACTLY as written, character for character, ' +
@@ -1191,7 +1295,12 @@ function buildSystemPrompt(profile, topic, vocab, stage, memory) {
   const vocabBlock = vocab.length
     ? 'ACTIVE TARGET PHRASES the learner is trying to acquire:\n' + vocabLines + '\n\n' + injectionRule +
       '\nAfter you use a target phrase, steer the conversation so the learner has a natural reason to reuse it ' +
-      'in their own answer. Never announce that you are practising a phrase and never label it.'
+      'in their own answer. Never announce that you are practising a phrase and never label it.' +
+      (hasWords
+        ? '\nEntries marked "word" are single words the learner was missing. Do not hand them over: create moments ' +
+          'where the learner has to name that thing or action themselves, for example by asking about it, and only ' +
+          'use the word yourself if they are clearly stuck.'
+        : '')
     : 'The learner has no active target phrases yet. Introduce useful, level-appropriate everyday expressions ' +
       'naturally and give the learner reasons to reuse them.';
 
@@ -1269,6 +1378,9 @@ function buildAnalysisPrompt(profile, topic, transcript, activeVocab, stage) {
     '  "recommended_phrases": [',
     '    { "phrase": "string", "translation": "string", "context": "string" }',
     '  ],',
+    '  "word_gaps": [',
+    '    { "word": "string", "translation": "string", "evidence": "string", "context": "string" }',
+    '  ],',
     '  "next_topic_recommendation": "string",',
     '  "cefr_level_feedback": "string",',
     '  "used_target_phrases": ["string"],',
@@ -1282,7 +1394,18 @@ function buildAnalysisPrompt(profile, topic, transcript, activeVocab, stage) {
     '- "grammar_mistakes": up to 8 real mistakes the LEARNER made. "original" is their exact wording, ' +
       '"correction" is the fixed ' + profile.target_language + ' sentence, "explanation" is one short sentence in English ' +
       'saying WHY. If the learner made no real mistakes, return an empty array.',
-    '- "recommended_phrases": 3 to 6 NEW ' + profile.target_language + ' phrases that would have made this exact ' +
+    '- "word_gaps": single ' + profile.target_language + ' WORDS the learner demonstrably needed in this ' +
+      'conversation and did not have. Include a word only when the transcript shows the gap: they switched to ' +
+      'another language for it, talked around it because they lacked it, used a wrong word in its place, asked what ' +
+      'it meant, or plainly failed to understand it when the partner used it. "evidence" quotes the learner\'s own ' +
+      'words that show the gap; if you cannot quote evidence, leave the word out. Give each word in dictionary ' +
+      'form: verbs in the infinitive, and nouns WITH their definite article in languages with grammatical gender ' +
+      '("die Quittung", "la facture", "la cuenta") because the gender has to be learned with the noun. ' +
+      '"translation" is English; "context" is one short English sentence on when they will need it. 0 to 6 ' +
+      'items. An empty array is normal and correct when there were no gaps: never pad it, never include a word ' +
+      'too rare to come up again, and never repeat a word that is part of a recommended phrase.',
+    '- "recommended_phrases": 3 to 6 NEW multi-word ' + profile.target_language + ' phrases (single words belong ' +
+      'in "word_gaps", not here) that would have made this exact ' +
       'conversation smoother, appropriate for CEFR ' + profile.current_cefr + '. "phrase" is in ' + profile.target_language +
       ', "translation" is English, "context" is one short English sentence on when to use it.',
     '- "next_topic_recommendation": one concrete conversation topic for the next session that will force the learner ' +
@@ -2112,6 +2235,7 @@ create table if not exists public.target_vocabulary (
   correction_context text,
   times_reviewed int default 0,
   status text default 'learning',
+  kind text not null default 'phrase',  -- 'phrase' | 'word'
   mastered_at timestamptz,
   created_at timestamptz default now()
 );
@@ -2240,7 +2364,12 @@ function VocabBar({ vocab, loading, onSuggest }) {
         const pct = (used / MASTERY_THRESHOLD) * 100;
         return (
           <div key={v.id} className="w-44 shrink-0 rounded-xl border border-gray-700/70 bg-gray-800 p-3">
-            <div className="truncate text-sm font-medium text-white" title={v.phrase}>{v.phrase}</div>
+            <div className="flex items-center gap-1.5">
+              {v.kind === 'word' ? (
+                <span className="shrink-0 rounded bg-amber-500/20 px-1 py-px text-[9px] font-semibold uppercase tracking-wide text-amber-300">word</span>
+              ) : null}
+              <span className="truncate text-sm font-medium text-white" title={v.phrase}>{v.phrase}</span>
+            </div>
             <div className="mt-0.5 h-4 truncate text-xs text-gray-400" title={v.translation || ''}>
               {v.translation || ''}
             </div>
@@ -2607,6 +2736,9 @@ function IslandSheet({
                           <div className="mt-2 space-y-1 border-t border-gray-700/60 pt-2">
                             {st.phrases.map((ph, i) => (
                               <div key={i} className="truncate">
+                                {ph.kind === 'word' ? (
+                                  <span className="mr-1.5 rounded bg-amber-500/20 px-1 py-px text-[9px] font-semibold uppercase tracking-wide text-amber-300">word</span>
+                                ) : null}
                                 <span className="text-gray-200">{ph.phrase}</span>
                                 {ph.translation ? <span className="text-gray-500"> — {ph.translation}</span> : null}
                               </div>
@@ -3019,9 +3151,12 @@ function SuggestSheet({
                   <span className="min-w-0 flex-1">
                     <span className="flex flex-wrap items-center gap-2">
                       <span className="text-sm font-medium text-white">{it.phrase}</span>
+                      {it.kind === 'word' ? (
+                        <span className="rounded bg-amber-500/20 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-amber-300">word</span>
+                      ) : null}
                       {it.source === 'manual' ? (
                         <span className="rounded bg-gray-700 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-gray-300">yours</span>
-                      ) : it.category ? (
+                      ) : it.category && it.kind !== 'word' ? (
                         <span className="rounded bg-indigo-500/20 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-indigo-300">{it.category}</span>
                       ) : null}
                     </span>
@@ -3599,10 +3734,11 @@ function FeedbackSheet({ feedback, saving, saveNote, onClose }) {
 
   const mistakes = Array.isArray(feedback.grammar_mistakes) ? feedback.grammar_mistakes : [];
   const phrases = Array.isArray(feedback.recommended_phrases) ? feedback.recommended_phrases : [];
+  const words = Array.isArray(feedback.word_gaps) ? feedback.word_gaps : [];
 
   const tabs = [
     { id: 'grammar', label: 'Grammar', count: mistakes.length },
-    { id: 'vocab', label: 'New Vocab', count: phrases.length },
+    { id: 'vocab', label: 'New Vocab', count: phrases.length + words.length },
     { id: 'summary', label: 'Summary', count: null }
   ];
 
@@ -3659,8 +3795,30 @@ function FeedbackSheet({ feedback, saving, saveNote, onClose }) {
           ) : null}
 
           {tab === 'vocab' ? (
-            phrases.length ? (
+            (phrases.length || words.length) ? (
               <div className="space-y-3">
+                {words.length ? (
+                  <div className="text-[11px] font-semibold uppercase tracking-wider text-amber-300">
+                    Words you were missing
+                  </div>
+                ) : null}
+                {words.map((w, i) => (
+                  <div key={'w' + i} className="rounded-xl border border-amber-500/30 bg-amber-500/5 p-3.5">
+                    <div className="flex items-center gap-2">
+                      <span className="text-sm font-medium text-white">{w.word}</span>
+                      <span className="rounded bg-amber-500/20 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-amber-300">word</span>
+                    </div>
+                    <div className="mt-0.5 text-sm text-gray-400">{w.translation}</div>
+                    <div className="mt-2 border-t border-gray-700/60 pt-2 text-xs leading-relaxed text-gray-500">
+                      You needed it when you said: <span className="italic text-gray-400">"{w.evidence}"</span>
+                    </div>
+                  </div>
+                ))}
+                {words.length && phrases.length ? (
+                  <div className="pt-1 text-[11px] font-semibold uppercase tracking-wider text-indigo-300">
+                    Phrases to start using
+                  </div>
+                ) : null}
                 {phrases.map((p, i) => (
                   <div key={i} className="rounded-xl border border-gray-800 bg-gray-800/50 p-3.5">
                     <div className="text-sm font-medium text-white">{p.phrase}</div>
@@ -4047,18 +4205,20 @@ function App() {
     if (!phrases.length) return;
 
     try {
+      const lang = languageRef.current;
       const existing = await scoped(
-        client.from('target_vocabulary').select('phrase'), learnerRef.current, languageRef.current
+        client.from('target_vocabulary').select('phrase, kind'), learnerRef.current, lang
       );
       if (existing.error) throw new Error(existing.error.message);
-      const known = new Set((existing.data || []).map(r => normalizeText(r.phrase)));
+      const known = new Set((existing.data || []).map(r => vocabKey(r.phrase, r.kind, lang)));
 
       const rows = phrases
-        .filter(p => !known.has(normalizeText(p.phrase)))
+        .filter(p => !known.has(vocabKey(p.phrase, p.kind, lang)))
         .map(p => ({
           user_id: learnerRef.current,
-          target_language: languageRef.current,
+          target_language: lang,
           phrase: p.phrase,
+          kind: p.kind || detectKind(p.phrase, lang),
           translation: p.translation || null,
           correction_context: p.note || null,
           times_reviewed: 0,
@@ -4879,6 +5039,16 @@ function App() {
     const analysis = {
       grammar_mistakes: Array.isArray(parsed.grammar_mistakes) ? parsed.grammar_mistakes : [],
       recommended_phrases: Array.isArray(parsed.recommended_phrases) ? parsed.recommended_phrases : [],
+      // Only words the analyser could back with evidence from the transcript.
+      word_gaps: (Array.isArray(parsed.word_gaps) ? parsed.word_gaps : [])
+        .filter(w => w && w.word && String(w.word).trim() && w.evidence && String(w.evidence).trim())
+        .slice(0, 6)
+        .map(w => ({
+          word: String(w.word).trim(),
+          translation: w.translation ? String(w.translation).trim() : '',
+          evidence: String(w.evidence).trim(),
+          context: w.context ? String(w.context).trim() : ''
+        })),
       next_topic_recommendation: parsed.next_topic_recommendation || '',
       cefr_level_feedback: parsed.cefr_level_feedback || '',
       stage_goal_met: !!parsed.stage_goal_met,
@@ -4898,10 +5068,15 @@ function App() {
         .map(p => normalizeText(p))
         .filter(Boolean)
     );
+    const modelUsedHeads = new Set(
+      (Array.isArray(parsed.used_target_phrases) ? parsed.used_target_phrases : []).map(p => headwordOf(p, sessionLanguage)).filter(Boolean)
+    );
     const progressed = [];
     const masteredNow = [];
     for (const v of sessionVocab) {
-      if (phraseWasUsed(v.phrase, learnerText) || modelUsed.has(normalizeText(v.phrase))) {
+      if (phraseWasUsed(v.phrase, learnerText, v.kind, sessionLanguage) ||
+          modelUsed.has(normalizeText(v.phrase)) ||
+          (v.kind === 'word' && modelUsedHeads.has(headwordOf(v.phrase, sessionLanguage)))) {
         const times = (v.times_reviewed || 0) + 1;
         const nextStatus = times >= MASTERY_THRESHOLD ? 'mastered' : 'learning';
         progressed.push({ id: v.id, phrase: v.phrase, times_reviewed: times, status: nextStatus });
@@ -4919,28 +5094,50 @@ function App() {
 
     const problems = [];
 
-    // 1. Insert newly recommended phrases (skip ones already tracked).
+    // What was actually written, so the summary never claims skipped duplicates.
+    let savedPhrases = 0;
+    let savedWords = 0;
+
+    // 1. Insert new phrases and the single words the learner was missing
+    //    (skip anything already tracked; words dedupe on their headword).
     try {
-      if (analysis.recommended_phrases.length && client) {
-        const existing = await scoped(client.from('target_vocabulary').select('phrase'), sessionLearner, sessionLanguage);
+      if ((analysis.recommended_phrases.length || analysis.word_gaps.length) && client) {
+        const existing = await scoped(client.from('target_vocabulary').select('phrase, kind'), sessionLearner, sessionLanguage);
         if (existing.error) throw new Error(existing.error.message);
 
-        const known = new Set((existing.data || []).map(r => normalizeText(r.phrase)));
-        const rows = analysis.recommended_phrases
-          .filter(p => p && p.phrase && !known.has(normalizeText(p.phrase)))
-          .map(p => ({
+        const known = new Set((existing.data || []).map(r => vocabKey(r.phrase, r.kind, sessionLanguage)));
+        const rows = [];
+        const take = (text, kind, translation, context) => {
+          const key = vocabKey(text, kind, sessionLanguage);
+          if (!key || known.has(key)) return;
+          known.add(key);
+          rows.push({
             user_id: sessionLearner,
             target_language: sessionLanguage,
-            phrase: String(p.phrase).trim(),
-            translation: p.translation ? String(p.translation).trim() : null,
-            correction_context: p.context ? String(p.context).trim() : null,
+            phrase: String(text).trim(),
+            kind: kind,
+            translation: translation ? String(translation).trim() : null,
+            correction_context: context || null,
             times_reviewed: 0,
             status: 'learning'
-          }));
+          });
+        };
+
+        analysis.recommended_phrases
+          .filter(p => p && p.phrase)
+          // A "phrase" that turns out to be one word is still a word.
+          .forEach(p => take(p.phrase, detectKind(p.phrase, sessionLanguage), p.translation, p.context ? String(p.context).trim() : ''));
+
+        analysis.word_gaps.forEach(w => take(
+          w.word, 'word', w.translation,
+          (w.context ? w.context + ' ' : '') + 'You needed it when you said: "' + w.evidence + '"'
+        ));
 
         if (rows.length) {
           const ins = await client.from('target_vocabulary').insert(rows);
           if (ins.error) throw new Error(ins.error.message);
+          savedWords = rows.filter(r => r.kind === 'word').length;
+          savedPhrases = rows.length - savedWords;
         }
       }
     } catch (err) {
@@ -4992,7 +5189,8 @@ function App() {
       pushToast('error', 'Some data did not save: ' + problems.join(', ') + '.');
     } else {
       const bits = [];
-      if (analysis.recommended_phrases.length) bits.push(analysis.recommended_phrases.length + ' new phrases');
+      if (savedPhrases) bits.push(savedPhrases + ' new phrase' + (savedPhrases === 1 ? '' : 's'));
+      if (savedWords) bits.push(savedWords + ' new word' + (savedWords === 1 ? '' : 's'));
       if (progressed.length) bits.push(progressed.length + ' reviewed');
       if (masteredNow.length) bits.push(masteredNow.length + ' mastered');
       setSaveNote('Saved' + (bits.length ? ' · ' + bits.join(' · ') : '') + '.');
@@ -5250,15 +5448,18 @@ function App() {
   }, []);
 
   const addManualPhrase = useCallback((phrase, translation) => {
-    const key = normalizeText(phrase);
+    const lang = languageRef.current;
+    const kind = detectKind(phrase, lang);
+    const key = vocabKey(phrase, kind, lang);
     let duplicate = false;
     setSuggestItems(prev => {
-      if (prev.some(it => normalizeText(it.phrase) === key)) {
+      if (prev.some(it => vocabKey(it.phrase, it.kind, lang) === key)) {
         duplicate = true;
         return prev;
       }
       return [{
         phrase: phrase,
+        kind: kind,
         translation: translation || '',
         context: '',
         category: '',
@@ -5276,15 +5477,22 @@ function App() {
     setSuggestBusy(true);
     setSuggestNote('Saving to your vocabulary…');
     try {
+      const lang = languageRef.current;
       const known = await fetchKnownPhrases();
-      const knownKeys = new Set(known.map(normalizeText));
+      const knownKeys = new Set(known.map(k => vocabKey(k, undefined, lang)));
 
       const rows = chosen
-        .filter(it => !knownKeys.has(normalizeText(it.phrase)))
+        .filter(it => {
+          const key = vocabKey(it.phrase, it.kind, lang);
+          if (knownKeys.has(key)) return false;
+          knownKeys.add(key);
+          return true;
+        })
         .map(it => ({
           user_id: learnerRef.current,
-          target_language: languageRef.current,
+          target_language: lang,
           phrase: it.phrase,
+          kind: it.kind || detectKind(it.phrase, lang),
           translation: it.translation || null,
           correction_context: it.context || null,
           times_reviewed: 0,

@@ -342,6 +342,18 @@ Turkish is generated on demand rather than stored, because the schema has no col
 
 ---
 
+### Single words, when you need them
+
+Most of what the app saves is multi-word — chunks are what make speech fluent. But sometimes the gap is one word: you reached for *receipt* and it wasn't there. So vocabulary entries are either a **phrase** or a **word**.
+
+**Words are saved on evidence, not quota.** After a session the analysis lists single words you *demonstrably* lacked — you switched language for them, talked around them, used the wrong word, asked what one meant, or didn't understand it when your partner said it. It must quote your own words as proof; no quote, no word. An empty list is the normal result of a session that went fine.
+
+Words are stored in **dictionary form** — infinitive for verbs, and nouns *with their article* in gendered languages (`die Quittung`, `la cuenta`), because the gender has to be learned with the noun. The feedback sheet shows each one under *Words you were missing* with the sentence where you needed it, and they carry a **word** badge everywhere.
+
+Suggestions and island stages may each include **at most two** single words, and only ones their situation can't be discussed without.
+
+**Counting a word's use** works differently from a phrase. A word has to appear as a token of its own, so *Hund* is not "used" inside *Hundefutter*, and *receipt* is not used in *received*. Inflection is accepted — the whole word plus a short ending (*Quittung → Quittungen*, *borrow → borrowed*), or a verb's stem after its infinitive ending drops (*verstehen → verstehe*, *hablar → hablamos*). Articles are ignored when matching, per language: *die Quittung* counts in *eine Quittung*, while English *a lot* stays a two-word phrase. Irregular forms (*gehen → ging*) are left to the analyser's own judgement. Your partner is told which targets are words, and to make you produce them rather than hand them over.
+
 ## Injection modes
 
 | Mode | Behaviour |
