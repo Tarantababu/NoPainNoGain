@@ -920,36 +920,127 @@ async function suggestIslands(apiKey, profile, aboutYou) {
     .map(i => ({ name: String(i.name).trim(), why: i.why ? String(i.why).trim() : '' }));
 }
 
-// A stage is only finished when the analysis says the objective was met AND
-// every phrase it introduced has been genuinely used in conversation.
+// A stage clears when both halves are satisfied:
+//   - every concrete check of its objective has been shown in some session
+//     (checks accumulate: once met, a check stays met), and
+//   - every phrase it introduced has been used in STAGE_PHRASE_SESSIONS
+//     separate sessions, which proves recall on another day. Vocabulary
+//     mastery proper stays at MASTERY_THRESHOLD; flashcards do long-term work.
+const STAGE_PHRASE_SESSIONS = 2;
+const STUCK_AFTER_SESSIONS = 3;
+const FOCUS_SESSION_SECONDS = 10 * 60;
+
 function stageGate(stage, vocabRows) {
   const phrases = Array.isArray(stage.phrases) ? stage.phrases : [];
   const lang = stage.target_language;
   const byPhrase = new Map();
   (vocabRows || []).forEach(v => byPhrase.set(vocabKey(v.phrase, v.kind, lang), v));
 
-  let mastered = 0;
+  let ready = 0;
   const outstanding = [];
-  phrases.forEach(p => {
+  const phraseStates = phrases.map(p => {
     // A stage word may already be in the list without its article, or with it.
     const row = byPhrase.get(vocabKey(p.phrase, p.kind, lang));
-    if (row && row.status === 'mastered') mastered += 1;
-    else outstanding.push({
-      phrase: p.phrase,
-      uses: row ? (row.times_reviewed || 0) : 0
-    });
+    const uses = row ? (row.times_reviewed || 0) : 0;
+    const isReady = !!row && (row.status === 'mastered' || uses >= STAGE_PHRASE_SESSIONS);
+    if (isReady) ready += 1;
+    else outstanding.push({ phrase: p.phrase, uses: uses });
+    return { phrase: p.phrase, kind: p.kind, uses: Math.min(uses, STAGE_PHRASE_SESSIONS), ready: isReady };
   });
 
-  const vocabDone = phrases.length > 0 && mastered === phrases.length;
+  const checks = Array.isArray(stage.checks) ? stage.checks : [];
+  const checksMet = checks.filter(c => c.met).length;
+  // Stages from before checks existed fall back to the single verdict.
+  const aiDone = checks.length ? checksMet === checks.length : !!stage.ai_verdict;
+  const vocabDone = phrases.length > 0 && ready === phrases.length;
+
+  // One number for "how far through this stage": checks and phrase-sessions
+  // weighted equally, so a session's worth of work always moves the bar.
+  const phraseUnits = phrases.length * STAGE_PHRASE_SESSIONS;
+  const phraseDone = phraseStates.reduce((n, p) => n + p.uses, 0);
+  const checkPart = checks.length ? checksMet / checks.length : (aiDone ? 1 : 0);
+  const phrasePart = phraseUnits ? phraseDone / phraseUnits : 0;
+  const progress = Math.round(((checkPart + phrasePart) / 2) * 100);
+
   return {
     total: phrases.length,
-    mastered: mastered,
+    ready: ready,
     outstanding: outstanding,
+    phrases: phraseStates,
+    checks: checks,
+    checksMet: checksMet,
     vocabDone: vocabDone,
-    aiDone: !!stage.ai_verdict,
-    complete: vocabDone && !!stage.ai_verdict
+    aiDone: aiDone,
+    complete: vocabDone && aiDone,
+    progress: progress,
+    stuck: !(vocabDone && aiDone) && (stage.sessions_count || 0) >= STUCK_AFTER_SESSIONS
   };
 }
+
+// Fold one session's verdicts into the stage's checks. A check met before
+// stays met with its original evidence; a newly met one is flagged so the
+// feedback can celebrate it; an unmet one keeps the judge's latest note.
+function mergeStageChecks(checks, verdicts, nowIso) {
+  const byId = new Map((verdicts || []).map(v => [String(v.id), v]));
+  return (checks || []).map(c => {
+    const v = byId.get(String(c.id));
+    if (c.met) return Object.assign({}, c, { newly: false });
+    if (v && v.met && v.evidence && String(v.evidence).trim()) {
+      return Object.assign({}, c, {
+        met: true, newly: true, evidence: String(v.evidence).trim(), missing: '', met_at: nowIso
+      });
+    }
+    return Object.assign({}, c, {
+      newly: false,
+      missing: v && v.missing ? String(v.missing).trim() : (c.missing || '')
+    });
+  });
+}
+
+// Turn a stage objective into 2-3 checks a judge can verify from a transcript
+// of what the learner said. Style words that transcription cannot see are
+// ruled out, which is what failed "introduce the project without hesitation".
+async function generateStageChecks(apiKey, profile, stage) {
+  const raw = await chatCompletion(apiKey, [
+    {
+      role: 'system',
+      content: 'You write assessment criteria for spoken language practice. ' +
+        'You always reply with a single valid JSON object and nothing else.'
+    },
+    {
+      role: 'user',
+      content: [
+        'A ' + profile.target_language + ' learner at CEFR ' + profile.current_cefr + ' is working on this stage:',
+        'Title: ' + stage.title,
+        'Objective: ' + (stage.objective || stage.title),
+        'Scenario: ' + (stage.scenario || '—'),
+        'Original completion test: ' + (stage.done_when || '—'),
+        '',
+        'Split the objective into 2 or 3 concrete checks that a judge can verify ONLY from a written transcript ' +
+          'of what the learner said. Each check names one thing the learner must say or do in their own words: ' +
+          '"states what the project is for", "names one thing the team is working on now", "mentions a next step".',
+        '',
+        'Rules:',
+        '- Never use criteria transcription cannot see or that are matters of taste: no "without hesitation", ' +
+          '"fluently", "confidently", "naturally", "concisely", "clearly", "smoothly".',
+        '- Each check must be satisfiable in a single turn by a CEFR ' + profile.current_cefr + ' learner.',
+        '- Write each check as a short phrase in English, starting with a verb, max 12 words.',
+        '',
+        'Return ONLY: { "checks": [ { "text": "string" } ] }. Raw JSON, no fences.'
+      ].join('\n')
+    }
+  ], { json: true, temperature: 0.3, maxTokens: 400 });
+
+  const cleaned = raw.replace(/^```(?:json)?/i, '').replace(/```$/, '').trim();
+  const parsed = JSON.parse(cleaned);
+  const list = (Array.isArray(parsed.checks) ? parsed.checks : [])
+    .map(c => (c && c.text ? String(c.text).trim() : ''))
+    .filter(Boolean)
+    .slice(0, 3);
+  if (list.length < 2) throw new Error('Too few checks came back.');
+  return list.map((text, i) => ({ id: 'c' + (i + 1), text: text, met: false, evidence: '', missing: '', met_at: null }));
+}
+
 
 /* -------------------------------------------------------------- daily stats */
 
@@ -1407,7 +1498,15 @@ function buildSystemPrompt(profile, topic, vocab, stage, memory) {
       ? 'Give them room to use these structures: ' + stage.structures.join('; ') + '.'
       : ''),
     'Steer the conversation so the learner has to produce the stage phrases themselves, repeatedly and naturally. ' +
-      'Ask questions that can only really be answered using them. Do not lecture about the stage or mention it exists.'
+      'Ask questions that can only really be answered using them. Do not lecture about the stage or mention it exists.',
+    (stage.focus
+      ? 'THIS IS A SHORT FOCUSED PRACTICE. The learner has been working on this stage for a while and only these ' +
+        'pieces are still missing, so aim every question at them and ignore everything already done:\n' +
+        (stage.focus.checks || []).filter(c => !c.met).map(c => '- they still need to: ' + c.text).join('\n') +
+        ((stage.focus.outstanding || []).length
+          ? '\n- phrases they still need to use themselves: ' + stage.focus.outstanding.map(o => '"' + o.phrase + '"').join(', ')
+          : '')
+      : '')
   ].filter(Boolean).join('\n') : '';
 
   return [
@@ -1480,7 +1579,8 @@ function buildAnalysisPrompt(profile, topic, transcript, activeVocab, stage) {
     '  "conversation_summary": "string",',
     '  "learner_facts": ["string"],',
     '  "stage_goal_met": true,',
-    '  "stage_evidence": "string"',
+    '  "stage_evidence": "string",',
+    '  "stage_checks": [ { "id": "c1", "met": true, "evidence": "string", "missing": "string" } ]',
     '}',
     '',
     'Rules for the fields:',
@@ -1518,15 +1618,26 @@ function buildAnalysisPrompt(profile, topic, transcript, activeVocab, stage) {
     '- "learner_facts": up to 6 short facts, in English, that the LEARNER revealed about their own life in this ' +
       'conversation: job, people, places, plans, preferences, things that happened to them. Only what they actually ' +
       'said, never guesses, never facts about the partner. Empty array if they shared nothing personal.',
-    stage
-      ? '- "stage_goal_met" and "stage_evidence": this session was part of a language island. The stage objective ' +
+    (stage && Array.isArray(stage.checks) && stage.checks.length)
+      ? '- "stage_checks": this session was part of a language island stage ("' + stage.title + '"). Judge each ' +
+        'check below separately, strictly on what the LEARNER said, never on what the partner said:\n' +
+        stage.checks.map(c => '  ' + c.id + ': ' + c.text + (c.met ? ' (already met in an earlier session)' : '')).join('\n') +
+        '\nFor each check return its id, "met" true only if the learner\'s own words in THIS transcript show it, ' +
+        'and "evidence": a short verbatim quote of those words. If it is not met, "evidence" is "" and "missing" is ' +
+        'one short, encouraging sentence on what they still need to say. Judge content only: do not fail a check ' +
+        'for being long, hesitant, imperfect or wordy, since grammar is covered elsewhere and fillers are removed ' +
+        'from the transcript. Set "stage_goal_met" true only if every check is met, and "stage_evidence" to "".'
+      : null,
+    (stage && !(Array.isArray(stage.checks) && stage.checks.length)) ?
+      '- "stage_checks": []. And for "stage_goal_met" and "stage_evidence": this session was part of a language island. The stage objective ' +
         'was: "' + (stage.objective || stage.title) + '". It counts as met when: "' + (stage.done_when || 'the learner ' +
         'achieved the objective unaided') + '". Judge STRICTLY from the transcript, on what the LEARNER produced, not ' +
         'on what the partner said. Set "stage_goal_met" true only if the transcript really shows it, and quote the ' +
         'learner\'s own words in "stage_evidence" (one sentence). If it was not met, say what is still missing.'
-      : '- "stage_goal_met": false, and "stage_evidence": "" — this session was not part of an island.',
+      : null,
+    !stage ? '- "stage_goal_met": false, "stage_evidence": "", "stage_checks": [] — this session was not part of an island.' : null,
     'Output raw JSON only, with no markdown fences and no commentary.'
-  ].join('\n');
+  ].filter(line => line !== null).join('\n');
 }
 
 /* ============================================================================
@@ -2977,16 +3088,24 @@ function IslandSheet({
                     To clear “{current.title}”
                   </div>
                   <div className="space-y-1.5 text-xs">
-                    <div className={gate.aiDone ? 'text-emerald-300' : 'text-gray-400'}>
-                      {gate.aiDone ? '✓' : '○'} A session shows you can do it
-                    </div>
+                    {gate.checks.length ? gate.checks.map(c => (
+                      <div key={c.id} className={c.met ? 'text-emerald-300' : 'text-gray-400'}>
+                        {c.met ? '✓' : '○'} {c.text}
+                        {c.met && c.evidence ? <span className="block pl-4 italic text-gray-500">“{c.evidence}”</span> : null}
+                        {!c.met && c.missing ? <span className="block pl-4 text-gray-500">{c.missing}</span> : null}
+                      </div>
+                    )) : (
+                      <div className={gate.aiDone ? 'text-emerald-300' : 'text-gray-400'}>
+                        {gate.aiDone ? '✓' : '○'} A session shows you can do it
+                      </div>
+                    )}
                     <div className={gate.vocabDone ? 'text-emerald-300' : 'text-gray-400'}>
-                      {gate.vocabDone ? '✓' : '○'} All {gate.total} phrases mastered ({gate.mastered}/{gate.total})
+                      {gate.vocabDone ? '✓' : '○'} Each phrase used in {STAGE_PHRASE_SESSIONS} sessions ({gate.ready}/{gate.total})
                     </div>
                   </div>
                   {gate.outstanding.length ? (
                     <div className="mt-2 border-t border-gray-700/60 pt-2 text-[11px] text-gray-500">
-                      Still owed: {gate.outstanding.slice(0, 4).map(o => o.phrase + ' (' + o.uses + '/3)').join(' · ')}
+                      Still owed: {gate.outstanding.slice(0, 4).map(o => o.phrase + ' (' + o.uses + '/' + STAGE_PHRASE_SESSIONS + ')').join(' · ')}
                       {gate.outstanding.length > 4 ? ' …' : ''}
                     </div>
                   ) : null}
@@ -3543,7 +3662,7 @@ function Dashboard({
   mode, onModeChange, onSuggest, language, onLanguageChange, switchingLanguage,
   learner, learnerCount, onOpenProfiles, dailyStats, onOpenStats,
   srsCounts, srsLoading, unforgedCount, onStudy, onForge, newPerDay, onNewPerDayChange,
-  island, stage, doneStages, totalStages, onOpenIsland
+  island, stage, doneStages, totalStages, onOpenIsland, stageProgress, onFocusSession
 }) {
   const [custom, setCustom] = useState('');
   // An active island decides the topic; a freeform entry still overrides it.
@@ -3721,11 +3840,22 @@ function Dashboard({
               {stage.objective ? (
                 <div className="mt-1.5 text-xs leading-relaxed text-gray-400">{stage.objective}</div>
               ) : null}
-              {totalStages ? (
-                <div className="mt-3 h-1.5 w-full overflow-hidden rounded-full bg-gray-700">
-                  <div className="h-full rounded-full bg-indigo-500 transition-all"
-                    style={{ width: (doneStages / totalStages * 100) + '%' }} />
-                </div>
+              {stageProgress ? (
+                <React.Fragment>
+                  <div className="mt-3 flex items-center justify-between text-[11px] text-gray-400">
+                    <span>
+                      {stageProgress.checks.length
+                        ? stageProgress.checksMet + '/' + stageProgress.checks.length + ' goals'
+                        : (stageProgress.aiDone ? 'goal met' : 'goal to go')}
+                      {' · '}{stageProgress.ready}/{stageProgress.total} phrases ready
+                    </span>
+                    <span className="font-semibold tabular-nums text-indigo-300">{stageProgress.progress}%</span>
+                  </div>
+                  <div className="mt-1.5 h-1.5 w-full overflow-hidden rounded-full bg-gray-700">
+                    <div className="h-full rounded-full bg-indigo-500 transition-all"
+                      style={{ width: stageProgress.progress + '%' }} />
+                  </div>
+                </React.Fragment>
               ) : null}
             </React.Fragment>
           ) : (
@@ -3738,6 +3868,20 @@ function Dashboard({
             </React.Fragment>
           )}
         </button>
+
+        {stage && stageProgress && stageProgress.stuck ? (
+          <div className="mt-2.5 rounded-xl border border-amber-500/30 bg-amber-500/5 p-3.5">
+            <div className="text-sm font-medium text-amber-200">This stage is taking a while</div>
+            <p className="mt-0.5 text-xs leading-relaxed text-gray-400">
+              {stage.sessions_count} sessions in. A 10-minute session aimed only at what is still missing usually
+              gets it over the line.
+            </p>
+            <button onClick={onFocusSession}
+              className="no-tap mt-2.5 w-full rounded-lg bg-amber-500 px-3 py-2 text-xs font-semibold text-gray-900 transition hover:bg-amber-400">
+              Start a 10-minute focused session
+            </button>
+          </div>
+        ) : null}
 
         <div className="my-3 flex items-center gap-3">
           <div className="h-px flex-1 bg-gray-800" />
@@ -3855,9 +3999,72 @@ function TranscriptView({ messages, status, targetLanguage, live }) {
   );
 }
 
+// What to aim for while talking. Phrases tick the moment the learner says
+// them; goals can only be judged afterwards, so they show what is already met.
+function StageStrip({ stage, messages, language }) {
+  const [open, setOpen] = useState(true);
+  const learnerText = useMemo(
+    () => messages.filter(m => m.role === 'user').map(m => m.content).join(' \n '),
+    [messages]
+  );
+  if (!stage) return null;
+
+  const phrases = (stage.phrases || []).map(p => ({
+    phrase: p.phrase,
+    kind: p.kind,
+    ready: p.ready,
+    now: phraseWasUsed(p.phrase, learnerText, p.kind, language)
+  }));
+  const saidNow = phrases.filter(p => p.now).length;
+  const checks = stage.checks || [];
+
+  return (
+    <div className="border-b border-gray-800 bg-indigo-500/5 px-5 py-2">
+      <button type="button" onClick={() => setOpen(!open)}
+        className="no-tap flex w-full items-center justify-between gap-2 text-left">
+        <span className="truncate text-xs font-semibold text-indigo-300">
+          {stage.focus ? 'Focused · ' : 'Stage ' + stage.position + ' · '}{stage.title}
+        </span>
+        <span className="flex shrink-0 items-center gap-1.5 text-[11px] text-gray-400">
+          <span className="tabular-nums">{saidNow}/{phrases.length} said</span>
+          <svg className={'h-3 w-3 transition ' + (open ? 'rotate-180' : '')} viewBox="0 0 24 24" fill="none"
+            stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="m6 9 6 6 6-6" /></svg>
+        </span>
+      </button>
+
+      {open ? (
+        <div className="pb-1 pt-2">
+          {checks.length ? (
+            <div className="mb-2 space-y-0.5">
+              {checks.map(c => (
+                <div key={c.id} className={'text-[11px] leading-snug ' + (c.met ? 'text-emerald-300' : 'text-gray-300')}>
+                  {c.met ? '✓' : '○'} {c.text}
+                </div>
+              ))}
+            </div>
+          ) : null}
+          <div className="flex flex-wrap gap-1">
+            {phrases.map(p => (
+              <span key={p.phrase}
+                className={'rounded-md border px-1.5 py-0.5 text-[11px] transition ' + (p.now
+                  ? 'border-emerald-500/60 bg-emerald-500/15 text-emerald-200'
+                  : p.ready
+                    ? 'border-gray-700 bg-gray-800/60 text-gray-500'
+                    : 'border-gray-700 text-gray-300')}>
+                {p.now ? '✓ ' : ''}{p.phrase}
+              </span>
+            ))}
+          </div>
+          <div className="mt-1.5 text-[10px] text-gray-600">Goals are judged after the session from what you said.</div>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 function SessionScreen({
   profile, topic, messages, status, secondsLeft, onToggleMic, onEnd, micDisabled, vocabCount,
-  mode, muted, connectionState
+  mode, muted, connectionState, stageInfo
 }) {
   const isLive = mode === MODE_REALTIME;
   const isRecording = status === 'recording' || status === 'listening';
@@ -3910,6 +4117,8 @@ function SessionScreen({
         <div className="mt-0.5 truncate text-sm text-gray-300" title={topic}>{topic}</div>
       </div>
 
+      <StageStrip stage={stageInfo} messages={messages} language={profile.target_language} />
+
       <main className="flex-1 overflow-y-auto px-4 py-4">
         <TranscriptView messages={messages} status={status} targetLanguage={profile.target_language} live={isLive} />
       </main>
@@ -3948,8 +4157,141 @@ function SessionScreen({
 
 /* --------------------------------------------------------- feedback bottom sheet */
 
+function StageResult({ r }) {
+  const goalsLeft = r.checks.filter(c => !c.met).length;
+  const phraseSessionsLeft = r.phrases.reduce((n, p) => n + Math.max(0, STAGE_PHRASE_SESSIONS - p.after), 0);
+  const gained = r.progressAfter - r.progressBefore;
+
+  return (
+    <div className="space-y-4">
+      <div className="rounded-xl border border-indigo-500/40 bg-indigo-500/10 p-4">
+        <div className="text-[11px] font-semibold uppercase tracking-wider text-indigo-300">
+          Stage {r.position}{r.total ? ' of ' + r.total : ''}
+        </div>
+        <div className="mt-0.5 text-sm font-medium text-white">{r.title}</div>
+        <div className="mt-3 flex items-center justify-between text-xs">
+          <span className="text-gray-400">{r.progressBefore}% → <span className="font-semibold text-white">{r.progressAfter}%</span></span>
+          {gained > 0 ? <span className="font-semibold text-emerald-300">+{gained}% this session</span> : null}
+        </div>
+        <div className="relative mt-1.5 h-2 w-full overflow-hidden rounded-full bg-gray-700">
+          <div className="absolute inset-y-0 left-0 rounded-full bg-emerald-500/70" style={{ width: r.progressAfter + '%' }} />
+          <div className="absolute inset-y-0 left-0 rounded-full bg-indigo-500" style={{ width: r.progressBefore + '%' }} />
+        </div>
+      </div>
+
+      {r.checks.length ? (
+        <div>
+          <div className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-gray-500">Goals</div>
+          <div className="space-y-2">
+            {r.checks.map(c => (
+              <div key={c.id} className={'rounded-xl border p-3 ' + (c.newly
+                ? 'border-emerald-500/50 bg-emerald-500/10'
+                : c.met ? 'border-gray-800 bg-gray-800/30' : 'border-gray-800 bg-gray-800/50')}>
+                <div className={'flex items-start gap-2 text-sm ' + (c.met ? 'text-emerald-200' : 'text-gray-200')}>
+                  <span className="shrink-0">{c.met ? '✓' : '○'}</span>
+                  <span className="flex-1">{c.text}</span>
+                  {c.newly ? <span className="shrink-0 rounded bg-emerald-500/25 px-1.5 py-0.5 text-[10px] font-semibold uppercase text-emerald-200">new</span> : null}
+                </div>
+                {c.met && c.evidence ? (
+                  <div className="mt-1 pl-5 text-xs italic text-gray-400">“{c.evidence}”</div>
+                ) : null}
+                {!c.met && c.missing ? (
+                  <div className="mt-1 pl-5 text-xs text-gray-400">{c.missing}</div>
+                ) : null}
+              </div>
+            ))}
+          </div>
+        </div>
+      ) : null}
+
+      <div>
+        <div className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-gray-500">
+          Phrases · each needs {STAGE_PHRASE_SESSIONS} sessions
+        </div>
+        <div className="space-y-1.5">
+          {r.phrases.map(p => (
+            <div key={p.phrase} className="flex items-center gap-2 text-sm">
+              <span className="flex shrink-0 gap-1">
+                {Array.from({ length: STAGE_PHRASE_SESSIONS }).map((_, i) => (
+                  <span key={i} className={'h-2 w-2 rounded-full ' + (i < p.before
+                    ? 'bg-indigo-400'
+                    : i < p.after ? 'bg-emerald-400' : 'bg-gray-700')} />
+                ))}
+              </span>
+              <span className={'truncate ' + (p.ready ? 'text-gray-400' : 'text-gray-200')}>{p.phrase}</span>
+              {p.after > p.before ? <span className="shrink-0 text-[11px] font-semibold text-emerald-300">+1</span> : null}
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {r.cleared ? (
+        <p className="rounded-xl bg-emerald-500/10 p-3 text-center text-sm font-medium text-emerald-200">Stage cleared.</p>
+      ) : (
+        <p className="text-center text-xs text-gray-500">
+          To clear this stage: {goalsLeft ? goalsLeft + ' goal' + (goalsLeft === 1 ? '' : 's') : 'no goals'}
+          {' and '}{phraseSessionsLeft ? phraseSessionsLeft + ' more phrase use' + (phraseSessionsLeft === 1 ? '' : 's') + ' in later sessions' : 'no phrases'} left.
+        </p>
+      )}
+    </div>
+  );
+}
+
+function StageCelebration({ r, onClose }) {
+  const islandDone = !r.nextTitle;
+  const owned = r.phrases.slice(0, 5);
+  return (
+    <div className="fixed inset-0 z-[60] flex items-center justify-center p-6">
+      <div className="fade-in absolute inset-0 bg-black/75 backdrop-blur-sm" onClick={onClose} />
+      <div className="sheet-up relative w-full max-w-sm rounded-3xl border border-emerald-500/40 bg-gray-900 p-6 text-center shadow-2xl">
+        <div className="mx-auto mb-3 flex h-16 w-16 items-center justify-center rounded-2xl bg-emerald-500/15 text-emerald-300">
+          <LogoMark className="h-9 w-9" />
+        </div>
+        <div className="text-[11px] font-semibold uppercase tracking-wider text-emerald-300">
+          {islandDone ? 'Island complete' : 'Stage ' + r.position + (r.total ? ' of ' + r.total : '') + ' cleared'}
+        </div>
+        <h2 className="mt-1 text-xl font-semibold tracking-tight text-white">{r.title}</h2>
+        <p className="mt-2 text-sm text-gray-400">
+          {islandDone
+            ? 'Every stage done. This subject is yours now — you can hold it in real conversation.'
+            : 'You showed you can do it, and these are yours now:'}
+        </p>
+
+        {!islandDone ? (
+          <div className="mt-3 space-y-1 text-left">
+            {owned.map(p => (
+              <div key={p.phrase} className="truncate rounded-lg bg-gray-800/70 px-3 py-1.5 text-sm text-gray-200">
+                <span className="mr-1.5 text-emerald-300">✓</span>{p.phrase}
+              </div>
+            ))}
+          </div>
+        ) : null}
+
+        {!islandDone ? (
+          <div className="mt-4 rounded-xl border border-indigo-500/30 bg-indigo-500/10 p-3 text-left">
+            <div className="text-[11px] font-semibold uppercase tracking-wider text-indigo-300">Next up</div>
+            <div className="mt-0.5 text-sm text-white">{r.nextTitle}</div>
+          </div>
+        ) : null}
+
+        <button onClick={onClose}
+          className="no-tap mt-5 w-full rounded-xl bg-emerald-600 px-4 py-3 text-sm font-semibold text-white transition hover:bg-emerald-500">
+          Continue
+        </button>
+      </div>
+    </div>
+  );
+}
+
 function FeedbackSheet({ feedback, saving, saveNote, onClose }) {
   const [tab, setTab] = useState('grammar');
+  const [picked, setPicked] = useState(false);
+  const stageResult = feedback ? feedback.stage_result : null;
+  // The stage result arrives a moment after the sheet opens; lead with it,
+  // unless the learner has already chosen a tab themselves.
+  useEffect(() => {
+    if (stageResult && !picked) setTab('island');
+  }, [stageResult, picked]);
   if (!feedback) return null;
 
   const mistakes = Array.isArray(feedback.grammar_mistakes) ? feedback.grammar_mistakes : [];
@@ -3957,6 +4299,7 @@ function FeedbackSheet({ feedback, saving, saveNote, onClose }) {
   const words = Array.isArray(feedback.word_gaps) ? feedback.word_gaps : [];
 
   const tabs = [
+    ...(stageResult ? [{ id: 'island', label: 'Island', count: null }] : []),
     { id: 'grammar', label: 'Grammar', count: mistakes.length },
     { id: 'vocab', label: 'New Vocab', count: phrases.length + words.length },
     { id: 'summary', label: 'Summary', count: null }
@@ -3985,7 +4328,7 @@ function FeedbackSheet({ feedback, saving, saveNote, onClose }) {
 
           <div className="mt-3 flex gap-1.5 rounded-xl bg-gray-800/70 p-1">
             {tabs.map(t => (
-              <button key={t.id} onClick={() => setTab(t.id)}
+              <button key={t.id} onClick={() => { setTab(t.id); setPicked(true); }}
                 className={'no-tap flex-1 rounded-lg px-2 py-2 text-xs font-medium transition ' + (tab === t.id
                   ? 'bg-gray-700 text-white'
                   : 'text-gray-400 hover:text-gray-200')}>
@@ -3996,6 +4339,8 @@ function FeedbackSheet({ feedback, saving, saveNote, onClose }) {
         </div>
 
         <div className="mx-auto w-full max-w-md flex-1 overflow-y-auto px-5 pb-8 pt-4">
+          {tab === 'island' && stageResult ? <StageResult r={stageResult} /> : null}
+
           {tab === 'grammar' ? (
             mistakes.length ? (
               <div className="space-y-3">
@@ -4114,6 +4459,7 @@ function App() {
   const [profilesOpen, setProfilesOpen] = useState(false);
   const [profilesBusy, setProfilesBusy] = useState(false);
   const [island, setIsland] = useState(null);
+  const [celebration, setCelebration] = useState(null);
   const [stages, setStages] = useState([]);
   const [islandOpen, setIslandOpen] = useState(false);
   const [islandBusy, setIslandBusy] = useState(false);
@@ -4181,6 +4527,9 @@ function App() {
   const sessionVocabRef = useRef([]);
   const sessionStageRef = useRef(null);
   const sessionMemoryRef = useRef(null);
+  const sessionAllVocabRef = useRef([]);
+  const sessionLengthRef = useRef(SESSION_SECONDS);
+  const checksInFlight = useRef(new Set());
   const endingRef = useRef(false);
   const statusRef = useRef('idle');
   const turkishCacheRef = useRef(new Map());
@@ -4401,6 +4750,7 @@ function App() {
 
       setIsland(isl.data);
       setStages(st.data || []);
+
       return { island: isl.data, stages: st.data || [] };
     } catch (err) {
       console.error(err);
@@ -4417,6 +4767,26 @@ function App() {
     () => stages.find(s => s.status === 'current') || null,
     [stages]
   );
+
+  // Stages planned before checks existed, or just promoted, get their
+  // objective turned into concrete checks the first time they are current.
+  // Runs as an effect so it only fires once the profile is actually loaded.
+  useEffect(() => {
+    const current = currentStage;
+    if (!current || !client || !config || !config.openaiKey || !profile) return;
+    if (Array.isArray(current.checks) && current.checks.length) return;
+    if (checksInFlight.current.has(current.id)) return;
+
+    checksInFlight.current.add(current.id);
+    generateStageChecks(config.openaiKey, profile, current)
+      .then(async checks => {
+        const upd = await client.from('island_stages').update({ checks: checks }).eq('id', current.id);
+        if (upd.error) throw new Error(upd.error.message);
+        setStages(prev => prev.map(x => (x.id === current.id ? Object.assign({}, x, { checks: checks }) : x)));
+      })
+      .catch(err => console.warn('Could not generate stage checks; the stage keeps its single verdict', err))
+      .finally(() => checksInFlight.current.delete(current.id));
+  }, [currentStage, client, config, profile]);
 
   // Phrases enter the vocabulary when their stage becomes current, so the SRS
   // queue only ever holds what the learner is actually working on.
@@ -4546,11 +4916,13 @@ function App() {
         const upd = await client.from('island_stages').update({ status: 'current' }).eq('id', next.id);
         if (upd.error) throw new Error(upd.error.message);
         await seedStagePhrases(next);
-        pushToast('success', (forced ? 'Skipped to' : 'Stage cleared. Next up: ') + ' ' + next.title + '.');
+        if (!(opts && opts.silent)) {
+          pushToast('success', (forced ? 'Skipped to' : 'Stage cleared. Next up:') + ' ' + next.title + '.');
+        }
       } else {
         const fin = await client.from('islands').update({ status: 'done' }).eq('id', stage.island_id);
         if (fin.error) throw new Error(fin.error.message);
-        pushToast('success', 'Island complete. That subject is yours now.');
+        if (!(opts && opts.silent)) pushToast('success', 'Island complete. That subject is yours now.');
       }
 
       await refreshIsland(client);
@@ -5012,19 +5384,26 @@ function App() {
 
   /* --------------------------------------------------------- session start */
 
-  const startSession = useCallback(async (chosenTopic) => {
+  const startSession = useCallback(async (chosenTopic, opts) => {
     if (!chosenTopic || !profile) return;
+    const focus = !!(opts && opts.focus);
 
     endingRef.current = false;
     setTopic(chosenTopic);
     setMessages([]);
     messagesRef.current = [];
-    setSecondsLeft(SESSION_SECONDS);
+    sessionLengthRef.current = focus ? FOCUS_SESSION_SECONDS : SESSION_SECONDS;
+    setSecondsLeft(sessionLengthRef.current);
     setFeedback(null);
     setSheetOpen(false);
     setMicDisabled(false);
     sessionVocabRef.current = vocab.slice();
-    sessionStageRef.current = currentStage;
+    sessionAllVocabRef.current = allVocab.slice();
+    // A focused session carries exactly what is still missing, so the partner
+    // can aim at it instead of replaying the whole stage.
+    sessionStageRef.current = currentStage
+      ? Object.assign({}, currentStage, focus ? { focus: stageGate(currentStage, allVocab) } : {})
+      : null;
     realtimeItemsRef.current = [];
     setConnectionState('');
     setMuted(false);
@@ -5079,7 +5458,7 @@ function App() {
       pushToast('error', err.message);
       setStatus('idle');
     }
-  }, [client, profile, vocab, config, mode, currentStage, island, startRealtimeSession, playAudioBlob, pushToast]);
+  }, [client, profile, vocab, allVocab, config, mode, currentStage, island, startRealtimeSession, playAudioBlob, pushToast]);
 
   /* --------------------------------------------------------- the voice turn */
 
@@ -5230,7 +5609,7 @@ function App() {
     setStatus('analyzing');
 
     const transcript = messagesRef.current.slice();
-    const usedSeconds = SESSION_SECONDS - secondsLeft;
+    const usedSeconds = sessionLengthRef.current - secondsLeft;
     const sessionTopic = topic;
     // Pin the language at end time so a mid-analysis switch cannot misfile rows.
     const sessionLanguage = languageRef.current;
@@ -5282,6 +5661,7 @@ function App() {
       cefr_level_feedback: parsed.cefr_level_feedback || '',
       stage_goal_met: !!parsed.stage_goal_met,
       stage_evidence: parsed.stage_evidence || '',
+      stage_checks: Array.isArray(parsed.stage_checks) ? parsed.stage_checks : [],
       conversation_summary: parsed.conversation_summary || '',
       learner_facts: Array.isArray(parsed.learner_facts)
         ? parsed.learner_facts.map(f => String(f).trim()).filter(Boolean).slice(0, 6)
@@ -5427,10 +5807,21 @@ function App() {
 
     // The island gate needs both halves: the analyser's verdict on the objective,
     // and every stage phrase actually used enough to count as owned.
+    let mergedChecks = null;
     if (sessionStage) {
       try {
-        const patch = { sessions_count: (sessionStage.sessions_count || 0) + 1 };
-        if (analysis.stage_goal_met) patch.ai_verdict = true;
+        // Read the stage fresh: checks may have been generated after the session began.
+        const cur = await client.from('island_stages').select('*').eq('id', sessionStage.id).maybeSingle();
+        const base = (cur.data) || sessionStage;
+        const patch = { sessions_count: (base.sessions_count || 0) + 1 };
+        if (Array.isArray(base.checks) && base.checks.length) {
+          mergedChecks = mergeStageChecks(base.checks, analysis.stage_checks, new Date().toISOString());
+          // Store without the per-session "newly" flag; it only matters for this feedback.
+          patch.checks = mergedChecks.map(c => { const x = Object.assign({}, c); delete x.newly; return x; });
+          patch.ai_verdict = mergedChecks.every(c => c.met);
+        } else if (analysis.stage_goal_met) {
+          patch.ai_verdict = true;
+        }
         const upd = await client.from('island_stages').update(patch).eq('id', sessionStage.id);
         if (upd.error) throw new Error(upd.error.message);
       } catch (err) {
@@ -5441,27 +5832,56 @@ function App() {
 
     const rows = await refreshVocab(client, sessionLanguage, sessionLearner);
 
-    // Both halves of the gate are objective, so when they are met there is
-    // nothing left to decide: move the island on and tell the learner.
+    // Show the learner what this session did for their stage, and when both
+    // halves of the gate are met there is nothing left to decide: move the
+    // island on and celebrate it rather than burying it in a toast.
     if (sessionStage) {
       try {
         const fresh = await client.from('island_stages').select('*').eq('id', sessionStage.id).maybeSingle();
-        if (!fresh.error && fresh.data && fresh.data.status === 'current') {
-          const gate = stageGate(fresh.data, rows);
-          if (gate.complete) await advanceStageRef.current(fresh.data, {});
+        const all = await client.from('island_stages').select('position, title')
+          .eq('island_id', sessionStage.island_id).order('position', { ascending: true });
+        if (!fresh.error && fresh.data) {
+          const before = stageGate(sessionStage, sessionAllVocabRef.current);
+          const after = stageGate(fresh.data, rows);
+          const next = ((all.data) || []).find(x => x.position === fresh.data.position + 1) || null;
+          const beforeUses = new Map(before.phrases.map(p => [p.phrase, p.uses]));
+
+          const result = {
+            position: fresh.data.position,
+            total: ((all.data) || []).length,
+            title: fresh.data.title,
+            checks: mergedChecks || [],
+            phrases: after.phrases.map(p => ({
+              phrase: p.phrase, kind: p.kind, before: beforeUses.get(p.phrase) || 0, after: p.uses, ready: p.ready
+            })),
+            progressBefore: before.progress,
+            progressAfter: after.progress,
+            cleared: after.complete && fresh.data.status === 'current',
+            nextTitle: next ? next.title : null
+          };
+          setFeedback(prev => prev ? Object.assign({}, prev, { stage_result: result }) : prev);
+
+          if (result.cleared) {
+            await advanceStageRef.current(fresh.data, { silent: true });
+            setCelebration(result);
+          }
         }
       } catch (err) {
-        console.error('Stage advance check failed', err);
+        console.error('Stage result failed', err);
       }
     }
 
     await Promise.all([
       refreshStats(client, sessionLanguage, sessionLearner),
       refreshRecommendedTopic(client, rows, sessionLanguage, sessionLearner),
-      refreshDailyStats(client, sessionLanguage, sessionLearner)
+      refreshDailyStats(client, sessionLanguage, sessionLearner),
+      // Without these the dashboard kept showing the stage as it was before
+      // the session, which made real progress look like nothing had happened.
+      refreshIsland(client, sessionLanguage, sessionLearner),
+      refreshSrs(client, sessionLanguage, sessionLearner)
     ]);
     endingRef.current = false;
-  }, [client, config, profile, topic, secondsLeft, releaseMic, stopPlayback, teardownRealtime, pushToast, refreshVocab, refreshStats, refreshRecommendedTopic, refreshDailyStats, refreshIsland]);
+  }, [client, config, profile, topic, secondsLeft, releaseMic, stopPlayback, teardownRealtime, pushToast, refreshVocab, refreshStats, refreshRecommendedTopic, refreshDailyStats, refreshIsland, refreshSrs]);
 
   /* ------------------------------------------------------- learner profiles */
 
@@ -5494,6 +5914,7 @@ function App() {
       setSrsIntroducedToday(0);
       setIsland(null);
       setStages([]);
+      setCelebration(null);
       turkishCacheRef.current = new Map();
 
       const cfg = loadConfig();
@@ -5609,6 +6030,7 @@ function App() {
       setSrsIntroducedToday(0);
       setIsland(null);
       setStages([]);
+      setCelebration(null);
       turkishCacheRef.current = new Map();
 
       const cfg = loadConfig();
@@ -6027,6 +6449,17 @@ function App() {
           mode={mode}
           muted={muted}
           connectionState={connectionState}
+          stageInfo={(() => {
+            const pinned = sessionStageRef.current;
+            if (!pinned) return null;
+            // Prefer the live row: its checks may have been generated after the session began.
+            const live = stages.find(x => x.id === pinned.id) || pinned;
+            const gate = stageGate(live, sessionAllVocabRef.current);
+            return {
+              position: live.position, title: live.title, focus: pinned.focus || null,
+              checks: gate.checks, phrases: gate.phrases
+            };
+          })()}
         />
       ) : (
         <Dashboard
@@ -6064,6 +6497,11 @@ function App() {
           doneStages={stages.filter(x => x.status === 'done').length}
           totalStages={stages.length}
           onOpenIsland={() => setIslandOpen(true)}
+          stageProgress={currentStage ? stageGate(currentStage, allVocab) : null}
+          onFocusSession={() => currentStage && startSession(
+            'Focused practice: ' + currentStage.title + (currentStage.scenario ? ' — ' + currentStage.scenario : ''),
+            { focus: true }
+          )}
         />
       )}
 
@@ -6157,6 +6595,8 @@ function App() {
           onClose={() => setExportOpen(false)}
         />
       ) : null}
+
+      {celebration ? <StageCelebration r={celebration} onClose={() => setCelebration(null)} /> : null}
 
       {sheetOpen && feedback ? (
         <FeedbackSheet

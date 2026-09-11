@@ -209,12 +209,20 @@ The planner is also fed your **recorded mistakes** from recent sessions, so the 
 
 "Topic of the day" becomes the current stage, and its objective and scenario are written into the session prompt — the partner steers so you have to produce the stage's phrases yourself, without ever mentioning the stage exists.
 
-A stage clears when **both** halves are satisfied:
+A stage clears when **both** halves are done:
 
-1. **The analyser rules the objective met**, judged strictly on what you produced, quoting your own words as evidence.
-2. **Every phrase in the stage is mastered** — three real uses in conversation.
+1. **Every goal is met.** When a stage becomes current, its objective is split into 2–3 concrete goals a judge can verify from a transcript — *"states what the project is for"*, *"mentions a next step"*. Style criteria that transcription cannot see (*"without hesitation"*, *"concisely"*) are ruled out. After each session the judge ticks each goal separately, quoting your words. **Goals accumulate**: once met, a goal stays met, even if a later session doesn't repeat it.
+2. **Every phrase is used in 2 separate sessions** — proof you can recall it on another day. (Vocabulary mastery proper is still 3; flashcards handle the long term.)
 
-When both land, the island advances on its own and the next stage's phrases enter your vocabulary. The island sheet always shows exactly which phrases are still owed and at what count, so a locked stage is never a mystery. If the partner never steers to a phrase and you get stuck, **Skip this stage** is there as an escape hatch.
+Both halves are objective, so when they land the island advances by itself — with a proper moment for it, showing what you now own and what is next.
+
+**You can always see where you are:**
+
+- **The dashboard** shows progress *inside* the current stage — *"1/3 goals · 3/5 phrases ready · 57%"* — not just stages completed.
+- **During the session**, a strip under the topic lists the goals and the phrases as chips that tick the moment you say them.
+- **After the session**, the feedback opens on an **Island** tab: how far the session moved you (*30% → 57%, +27%*), each goal with your quote or a note on what is still missing, and each phrase's progress.
+
+**When a stage drags** — three sessions without clearing — the dashboard offers a **10-minute focused session** aimed only at the goals and phrases still missing. **Skip this stage** remains in the island sheet as an escape hatch.
 
 One island runs per language at a time. Archiving keeps its phrases and history.
 
