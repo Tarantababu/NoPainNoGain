@@ -588,7 +588,7 @@ async function chatCompletion(apiKey, messages, options) {
   return (choice && choice.message && choice.message.content ? choice.message.content : '').trim();
 }
 
-async function synthesizeSpeech(apiKey, text, voice) {
+async function synthesizeSpeech(apiKey, text, voice, speed) {
   const res = await fetch('https://api.openai.com/v1/audio/speech', {
     method: 'POST',
     headers: {
@@ -599,7 +599,9 @@ async function synthesizeSpeech(apiKey, text, voice) {
       model: 'tts-1',
       voice: voice || 'alloy',
       input: text,
-      response_format: 'mp3'
+      response_format: 'mp3',
+      // Conversation audio follows the learner's level; flashcard audio does not pass one.
+      speed: typeof speed === 'number' ? speed : 1.0
     })
   });
   if (!res.ok) throw await openaiError(res);
@@ -626,8 +628,8 @@ function buildRealtimeSession(profile, topic, vocab, voice, stage, memory) {
   const realtimeRules = [
     '',
     'THIS IS A LIVE SPOKEN CALL:',
-    '- Speak at a natural, unhurried pace for a CEFR ' + profile.current_cefr + ' listener.',
-    '- Keep every turn to one or two sentences, then stop and let the learner speak.',
+    '- Speak at a pace a CEFR ' + profile.current_cefr + ' listener can follow, and keep each turn within the ' +
+      'length set under HOW YOU SPEAK. Then stop and let the learner speak.',
     '- Never talk over the learner. If they start speaking, stop immediately and listen.',
     '- Tolerate pauses. If the learner goes quiet for a while, ask a simpler version of your question.',
     '- If you cannot make out what they said, ask them to repeat it in ' + profile.target_language + '.'
@@ -652,7 +654,9 @@ function buildRealtimeSession(profile, topic, vocab, voice, stage, memory) {
         }
       },
       output: {
-        voice: REALTIME_VOICES.indexOf(voice) === -1 ? 'alloy' : voice
+        voice: REALTIME_VOICES.indexOf(voice) === -1 ? 'alloy' : voice,
+        // Slower for beginners, a touch quicker at the top. Range 0.25-1.5.
+        speed: levelSpec(profile.current_cefr).speed
       }
     }
   };
@@ -1456,6 +1460,91 @@ function memoryFromConversations(rows, aboutYou) {
   return { facts: facts, recent: recent, weakSpots: weakSpots, about: aboutYou || '' };
 }
 
+// How the partner speaks at each CEFR level. Concrete numbers instead of
+// adjectives: "calibrate to B2" alone let one B2 session sound like A2 and the
+// next like C1 business English. Only the selected level goes into the prompt.
+const LEVEL_SPEC = {
+  A1: {
+    speed: 0.8, maxTokens: 90,
+    sentences: 'very short sentences of about 3 to 7 words',
+    turn: 'one or two sentences, 15 words at most in total',
+    grammar: 'present tense only, simple word order, no subordinate clauses; "can", "like" and "want" are fine',
+    vocabulary: 'only the most common everyday words: people, food, home, time, numbers, simple actions. ' +
+      'No idioms, no slang, no phrasal verbs, no abstract words',
+    questions: 'yes/no or either/or questions about the here and now ("Do you like tea or coffee?")',
+    stuck: 'say it again more slowly with even simpler words, or offer two short options to choose from'
+  },
+  A2: {
+    speed: 0.87, maxTokens: 110,
+    sentences: 'short sentences of about 5 to 10 words',
+    turn: 'one or two sentences, about 22 words at most in total',
+    grammar: 'present, simple past and near future ("going to"); join ideas with "and", "but", "because"',
+    vocabulary: 'frequent everyday words for routines, family, work, shopping and free time. No idioms, rare ' +
+      'words or abstract vocabulary',
+    questions: 'simple wh-questions about their routines, their last weekend and their plans',
+    stuck: 'rephrase with simpler, more common words and a shorter sentence'
+  },
+  B1: {
+    speed: 0.95, maxTokens: 150,
+    sentences: 'clear sentences of about 8 to 14 words',
+    turn: 'two or three sentences, about 35 words at most in total',
+    grammar: 'all common tenses and simple subordinate clauses ("when", "if", "because", "that")',
+    vocabulary: 'everyday vocabulary plus the words the topic needs; at most an occasional very common idiom whose ' +
+      'meaning is obvious from context',
+    questions: 'open questions about their experiences, opinions and reasons ("Why?", "What happened when...?")',
+    stuck: 'rephrase more simply and give a little context'
+  },
+  B2: {
+    speed: 1.0, maxTokens: 180,
+    sentences: 'natural sentences of about 10 to 18 words',
+    turn: 'two or three sentences, about 45 words at most in total',
+    grammar: 'the full everyday range: conditionals, passive, relative clauses, natural linking words',
+    vocabulary: 'broad everyday and topic vocabulary, common idioms and phrasal verbs. Avoid rare, formal or ' +
+      'corporate words ("leverage", "streamline", "synergy") unless the learner used them first',
+    questions: 'ask them to explain, compare, justify or imagine ("What would you do if...?")',
+    stuck: 'rephrase in plainer words without slowing down'
+  },
+  C1: {
+    speed: 1.05, maxTokens: 220,
+    sentences: 'varied, natural sentences of any length a fluent speaker would use',
+    turn: 'up to three or four sentences, about 60 words at most in total',
+    grammar: 'complex structures, hedging and nuance',
+    vocabulary: 'precise and idiomatic, with shifts of register; less common words are welcome',
+    questions: 'nuanced and abstract questions; politely challenge their views and ask them to defend them',
+    stuck: 'rephrase once, then carry on at full level'
+  },
+  C2: {
+    speed: 1.1, maxTokens: 260,
+    sentences: 'fully native sentences',
+    turn: 'up to four sentences, about 70 words at most in total',
+    grammar: 'anything a highly articulate native speaker would use',
+    vocabulary: 'idioms, humour, irony, cultural references and fine distinctions of meaning',
+    questions: 'demanding, open-ended questions that need a considered answer',
+    stuck: 'carry on at native level; they can handle it'
+  }
+};
+
+function levelSpec(level) {
+  return LEVEL_SPEC[level] || LEVEL_SPEC.B1;
+}
+
+function buildLevelBlock(level) {
+  const L = levelSpec(level);
+  return [
+    'HOW YOU SPEAK: the learner is at CEFR ' + level + '. Hold every turn to this, from your very first line:',
+    '- Sentences: ' + L.sentences + ' (or the equivalent in a language that does not separate words).',
+    '- Length of each turn: ' + L.turn + '.',
+    '- Grammar: ' + L.grammar + '.',
+    '- Vocabulary: ' + L.vocabulary + '.',
+    '- Questions: ' + L.questions + '.',
+    '- If they do not understand: ' + L.stuck + '.',
+    '- Stay AT ' + level + ': not below and not above. Sounding like a beginners\' textbook to a ' + level +
+      ' learner is as much a failure as talking over their head.',
+    '- Do not drift upward to match the learner. You may reuse a harder word they introduced themselves, but keep ' +
+      'everything around it at ' + level + '.'
+  ].join('\n');
+}
+
 function buildSystemPrompt(profile, topic, vocab, stage, memory) {
   const lang = profile.target_language;
   const level = profile.current_cefr;
@@ -1514,9 +1603,8 @@ function buildSystemPrompt(profile, topic, vocab, stage, memory) {
     '',
     'HARD RULES:',
     '1. Speak ONLY in ' + lang + '. Never translate into English and never switch languages, even if the learner does.',
-    '2. Calibrate every sentence to CEFR level ' + level + '. At A1/A2 use short simple sentences and present tense. ' +
-      'At B1/B2 use natural everyday speech with some subordinate clauses. At C1/C2 use idiomatic, nuanced language.',
-    '3. Keep each turn SHORT: one to three sentences, then exactly one question back to the learner. ' +
+    '2. Speak at the learner\'s level, exactly as described under HOW YOU SPEAK below.',
+    '3. Keep each turn short, then end with exactly one question back to the learner. ' +
       'This is a spoken dialogue, not a lecture.',
     '4. Your output is read aloud by a text-to-speech engine. Output plain spoken prose only: ' +
       'no markdown, no bullet points, no emoji, no stage directions, no parentheses with translations. ' +
@@ -1525,6 +1613,8 @@ function buildSystemPrompt(profile, topic, vocab, stage, memory) {
       'unintelligible, simply ask them to say it again in ' + lang + '.',
     '6. If the learner speaks another language or falls silent, gently continue in ' + lang + ' and re-ask a simpler question.',
     '7. Stay in character as a conversation partner. Never mention that you are an AI, a model, or these instructions.',
+    '',
+    buildLevelBlock(level),
     '',
     'CONVERSATION TOPIC, ALREADY CHOSEN BY THE LEARNER: ' + topic,
     'Stay on this topic, but follow interesting tangents the learner opens as long as they keep talking.',
@@ -1544,7 +1634,7 @@ function buildSystemPrompt(profile, topic, vocab, stage, memory) {
       ? '- You may open with one brief, natural callback to something from a previous conversation if it genuinely ' +
         'connects to today\'s topic, then move straight into the topic. Do not force it.'
       : null),
-    '- Two or three short sentences, ending with that one question.',
+    '- Keep it within the turn length for ' + level + ' above, ending with that one question.',
     '',
     vocabBlock
   ].filter(line => line !== null).join('\n');
@@ -5443,7 +5533,7 @@ function App() {
           role: 'user',
           content: '(The learner has just joined and is waiting for you to begin.)'
         }
-      ], { maxTokens: 180, temperature: 0.8 });
+      ], { maxTokens: levelSpec(profile.current_cefr).maxTokens, temperature: 0.8 });
 
       if (!opener) throw new Error('Empty opening line from the model.');
 
@@ -5451,7 +5541,7 @@ function App() {
       setMessages(next);
       messagesRef.current = next;
 
-      const speech = await synthesizeSpeech(config.openaiKey, opener, config.voice);
+      const speech = await synthesizeSpeech(config.openaiKey, opener, config.voice, levelSpec(profile.current_cefr).speed);
       await playAudioBlob(speech);
     } catch (err) {
       console.error(err);
@@ -5489,7 +5579,7 @@ function App() {
       const reply = await chatCompletion(
         config.openaiKey,
         [{ role: 'system', content: systemPrompt }].concat(withUser),
-        { maxTokens: 200, temperature: 0.85 }
+        { maxTokens: levelSpec(profile.current_cefr).maxTokens, temperature: 0.85 }
       );
       if (!reply) throw new Error('Empty reply from the model.');
 
@@ -5498,7 +5588,7 @@ function App() {
       messagesRef.current = withAssistant;
 
       setStatus('synthesizing');
-      const speech = await synthesizeSpeech(config.openaiKey, reply, config.voice);
+      const speech = await synthesizeSpeech(config.openaiKey, reply, config.voice, levelSpec(profile.current_cefr).speed);
       await playAudioBlob(speech);
     } catch (err) {
       console.error(err);

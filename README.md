@@ -287,6 +287,21 @@ Under the hood every row carries `target_language`, and every read and write is 
 
 Pick a topic (recommended, or your own) and talk for thirty minutes. The countdown is visible, and hitting `00:00` triggers the analysis automatically. You can end early with **End & Analyze** at any point.
 
+### Speaking at your level
+
+The CEFR level you set for a language decides how your partner talks, in both modes. Each level has a concrete spec rather than an adjective — sentence and turn length, grammar, vocabulary band, the kind of questions asked, and what to do when you don't understand — and only your level's spec goes into the prompt:
+
+| Level | Sentences | Turn | Voice speed |
+| --- | --- | --- | --- |
+| A1 | 3–7 words, present tense, yes/no questions | ≤ 15 words | 0.8× |
+| A2 | 5–10 words, simple past and future | ≤ 22 words | 0.87× |
+| B1 | 8–14 words, simple subordinate clauses | ≤ 35 words | 0.95× |
+| B2 | 10–18 words, full everyday range, no corporate jargon | ≤ 45 words | 1.0× |
+| C1 | varied and natural, nuance and hedging | ≤ 60 words | 1.05× |
+| C2 | fully native, idiom and irony | ≤ 70 words | 1.1× |
+
+The partner is told to stay *at* the level — sounding like a beginners' textbook to a B2 learner counts as a failure too — and not to drift upward to match you: it may reuse a hard word you introduced, but keeps everything around it at your level. Change the level in Settings and the next session follows it. Each language keeps its own level.
+
 ### Your partner remembers you
 
 The partner opens **inside the topic you chose** — a line that sets the scene and one concrete question — and is explicitly forbidden from asking what you want to talk about. On an island stage it steps straight into the role-play.
