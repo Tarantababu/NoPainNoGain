@@ -6,6 +6,8 @@
 
 A voice-first language coach in **one HTML file**. You talk out loud for thirty minutes, and the mistakes you make become tomorrow's vocabulary.
 
+**Live: https://tarantababu.github.io/NoPainNoGain/** — hosted on GitHub Pages, redeployed on every push to `main`.
+
 No build step, no bundler, no server. Open `index.html` and it runs: React 18, Babel, Tailwind and the Supabase client all load from CDNs, and your own OpenAI and Supabase credentials are entered in the app and kept in `localStorage`.
 
 ---
@@ -165,6 +167,8 @@ On first run the app asks for:
 | Partner voice | Voice used for the spoken replies |
 
 Settings (the gear icon) reopens this screen later, and carries a **Reset this workspace** action at the bottom. It erases the vocabulary, flashcards, review history, sessions and island roadmap for the profile and language you currently have selected — and nothing else. Your other profiles, your other languages, and your level and injection mode all survive it. It asks twice, and shows you what is about to go.
+
+**OpenAI balance** also lives in Settings. OpenAI offers no API for reading your remaining credit, so the app keeps its own ledger: you type in what your billing page shows once, and every call the app makes is priced from the usage OpenAI reports back — tokens for `gpt-4o` and `gpt-realtime` (cached tokens at the cached rate), audio minutes for `whisper-1`, characters for `tts-1` — and subtracted. It shows *≈ $X left* with a breakdown, turns amber under $2 and red under $0.50, and links straight to OpenAI's billing page for the exact figure. It is an estimate by design: it counts only this app on this device, at list prices checked on 11 Sep 2026 (see `PRICES` in `index.html` if they change). The exact org-wide alternative — the Costs API — needs an admin key, which has no read-only mode and would sit in a browser that loads third-party scripts, so the app deliberately does not use it.
 
 **Test & Save** verifies the OpenAI key, probes the Supabase tables and writes your profile before letting you through. Everything is stored under the `fluentloop.config.v1` key in `localStorage` — nothing is sent anywhere else.
 

@@ -441,6 +441,96 @@ function missingLearnersTable(error) {
     (msg.indexOf('does not exist') !== -1 || msg.indexOf('schema cache') !== -1);
 }
 
+/* --------------------------------------------------------------- spend meter */
+
+// OpenAI has no API for remaining credit balance, so the app keeps its own
+// ledger: the learner enters what the billing page shows, and every call this
+// app makes is priced from the usage OpenAI reports back and subtracted.
+// List prices in USD, checked against the official model pages on 11 Sep 2026.
+const PRICES_AS_OF = '11 Sep 2026';
+const PRICES = {
+  chat: { input: 2.5, cachedInput: 1.25, output: 10 },          // gpt-4o, per 1M tokens
+  realtime: {                                                   // gpt-realtime, per 1M tokens
+    textIn: 4, audioIn: 32, cachedIn: 0.4, textOut: 16, audioOut: 64
+  },
+  whisperPerMinute: 0.006,                                      // whisper-1
+  ttsPerMillionChars: 15                                        // tts-1
+};
+const SPEND_KEY = 'fluentloop.spend.v1';
+const BILLING_URL = 'https://platform.openai.com/settings/organization/billing/overview';
+const SPEND_CATEGORIES = ['chat', 'transcription', 'speech', 'realtime'];
+
+function loadSpend() {
+  try {
+    const raw = localStorage.getItem(SPEND_KEY);
+    if (!raw) return null;
+    const s = JSON.parse(raw);
+    if (!s || typeof s.balance !== 'number') return null;
+    s.spent = typeof s.spent === 'number' ? s.spent : 0;
+    s.by = s.by || {};
+    return s;
+  } catch (e) {
+    return null;
+  }
+}
+
+function saveSpend(state) {
+  try { localStorage.setItem(SPEND_KEY, JSON.stringify(state)); } catch (e) { /* storage full or blocked */ }
+  try { window.dispatchEvent(new CustomEvent('fluentloop:spend')); } catch (e) { /* noop */ }
+}
+
+// A fresh balance starts a fresh ledger: whatever was spent before is already
+// reflected in the number the learner read off the billing page.
+function setStartingBalance(usd) {
+  const by = {};
+  SPEND_CATEGORIES.forEach(c => { by[c] = 0; });
+  saveSpend({ balance: usd, setAt: new Date().toISOString(), spent: 0, by: by });
+}
+
+function recordSpend(category, usd) {
+  if (!(usd > 0) || !isFinite(usd)) return;
+  const s = loadSpend();
+  if (!s) return; // nothing to subtract from until a balance is entered
+  s.spent += usd;
+  s.by[category] = (s.by[category] || 0) + usd;
+  saveSpend(s);
+}
+
+function costOfChat(usage) {
+  if (!usage) return 0;
+  const prompt = usage.prompt_tokens || 0;
+  const cached = (usage.prompt_tokens_details && usage.prompt_tokens_details.cached_tokens) || 0;
+  const out = usage.completion_tokens || 0;
+  return ((prompt - cached) * PRICES.chat.input + cached * PRICES.chat.cachedInput + out * PRICES.chat.output) / 1e6;
+}
+
+// Cached tokens are a subset of the input tokens of each modality, so they are
+// taken out before the rest is priced at the full rate.
+function costOfRealtimeResponse(usage) {
+  if (!usage) return 0;
+  const inD = usage.input_token_details || {};
+  const cachedD = inD.cached_tokens_details || {};
+  const outD = usage.output_token_details || {};
+  const cachedText = cachedD.text_tokens || 0;
+  const cachedAudio = cachedD.audio_tokens || 0;
+  const p = PRICES.realtime;
+  return (
+    Math.max(0, (inD.text_tokens || 0) - cachedText) * p.textIn +
+    Math.max(0, (inD.audio_tokens || 0) - cachedAudio) * p.audioIn +
+    (cachedText + cachedAudio) * p.cachedIn +
+    (outD.text_tokens || 0) * p.textOut +
+    (outD.audio_tokens || 0) * p.audioOut
+  ) / 1e6;
+}
+
+function costOfTranscription(seconds) {
+  return Math.max(0, seconds || 0) / 60 * PRICES.whisperPerMinute;
+}
+
+function costOfSpeech(text) {
+  return String(text || '').length / 1e6 * PRICES.ttsPerMillionChars;
+}
+
 /* -------------------------------------------------------------- OpenAI calls */
 
 async function openaiError(res) {
@@ -454,7 +544,7 @@ async function openaiError(res) {
   return new Error('OpenAI ' + res.status + ': ' + (detail || res.statusText));
 }
 
-async function transcribeAudio(apiKey, blob, language) {
+async function transcribeAudio(apiKey, blob, language, durationSec) {
   const ext = extensionForMime(blob.type);
   const form = new FormData();
   form.append('file', blob, 'speech.' + ext);
@@ -469,6 +559,7 @@ async function transcribeAudio(apiKey, blob, language) {
   });
   if (!res.ok) throw await openaiError(res);
   const data = await res.json();
+  recordSpend('transcription', costOfTranscription(durationSec));
   return (data.text || '').trim();
 }
 
@@ -492,6 +583,7 @@ async function chatCompletion(apiKey, messages, options) {
   });
   if (!res.ok) throw await openaiError(res);
   const data = await res.json();
+  recordSpend('chat', costOfChat(data.usage));
   const choice = data.choices && data.choices[0];
   return (choice && choice.message && choice.message.content ? choice.message.content : '').trim();
 }
@@ -511,6 +603,7 @@ async function synthesizeSpeech(apiKey, text, voice) {
     })
   });
   if (!res.ok) throw await openaiError(res);
+  recordSpend('speech', costOfSpeech(text));
   return await res.blob();
 }
 
@@ -1944,6 +2037,131 @@ const inputClass =
 
 /* -------------------------------------------------------------- setup screen */
 
+function formatUsd(v) {
+  const n = Number(v) || 0;
+  if (Math.abs(n) > 0 && Math.abs(n) < 0.01) return (n < 0 ? '-' : '') + '<$0.01';
+  return (n < 0 ? '-$' : '$') + Math.abs(n).toFixed(2);
+}
+
+function BalanceCard() {
+  const [ledger, setLedger] = useState(loadSpend);
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState('');
+
+  // Spending happens elsewhere in the app; keep the card current regardless.
+  useEffect(() => {
+    const refresh = () => setLedger(loadSpend());
+    window.addEventListener('fluentloop:spend', refresh);
+    window.addEventListener('storage', refresh);
+    return () => {
+      window.removeEventListener('fluentloop:spend', refresh);
+      window.removeEventListener('storage', refresh);
+    };
+  }, []);
+
+  function save(e) {
+    e.preventDefault();
+    const n = parseFloat(String(draft).replace(',', '.').replace(/[^0-9.]/g, ''));
+    if (!isFinite(n) || n < 0) return;
+    setStartingBalance(Math.round(n * 100) / 100);
+    setLedger(loadSpend());
+    setEditing(false);
+    setDraft('');
+  }
+
+  const remaining = ledger ? ledger.balance - ledger.spent : 0;
+  const tone = !ledger ? 'text-white'
+    : remaining < 0.5 ? 'text-red-300'
+    : remaining < 2 ? 'text-amber-300'
+    : 'text-emerald-300';
+  const since = ledger ? new Date(ledger.setAt).toLocaleDateString(undefined, { day: 'numeric', month: 'short' }) : '';
+
+  const billingLink = (
+    <a href={BILLING_URL} target="_blank" rel="noopener noreferrer"
+      className="no-tap inline-flex items-center gap-1 text-xs font-medium text-indigo-400 transition hover:text-indigo-300">
+      Exact balance on OpenAI
+      <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+        <path d="M7 17 17 7M8 7h9v9" />
+      </svg>
+    </a>
+  );
+
+  return (
+    <div className="mt-8 rounded-2xl border border-gray-800 bg-gray-800/40 p-4">
+      <div className="flex items-baseline justify-between">
+        <h2 className="text-sm font-semibold text-gray-200">OpenAI balance</h2>
+        {billingLink}
+      </div>
+
+      {ledger && !editing ? (
+        <React.Fragment>
+          <div className="mt-3 flex items-baseline gap-2">
+            <span className={'text-3xl font-semibold tabular-nums ' + tone}>≈ {formatUsd(remaining)}</span>
+            <span className="text-xs text-gray-500">left</span>
+          </div>
+          <p className="mt-1 text-xs text-gray-400">
+            {formatUsd(ledger.spent)} spent through this app since {since}, from {formatUsd(ledger.balance)}.
+          </p>
+
+          <div className="mt-3 grid grid-cols-4 gap-1.5 text-center">
+            {[
+              { key: 'chat', label: 'text' },
+              { key: 'transcription', label: 'listening' },
+              { key: 'speech', label: 'voice' },
+              { key: 'realtime', label: 'live' }
+            ].map(c => (
+              <div key={c.key} className="rounded-lg border border-gray-800 bg-gray-900/60 px-1 py-1.5">
+                <div className="text-xs font-semibold tabular-nums text-gray-200">{formatUsd(ledger.by[c.key] || 0)}</div>
+                <div className="text-[10px] uppercase tracking-wide text-gray-500">{c.label}</div>
+              </div>
+            ))}
+          </div>
+
+          {remaining < 2 ? (
+            <p className={'mt-3 text-xs ' + (remaining < 0.5 ? 'text-red-300' : 'text-amber-300')}>
+              Running low — sessions will fail once the credit runs out. Check the exact figure and top up on OpenAI.
+            </p>
+          ) : null}
+
+          <button type="button" onClick={() => { setEditing(true); setDraft(String(Math.max(0, remaining).toFixed(2))); }}
+            className="no-tap mt-3 w-full rounded-xl border border-gray-700 px-4 py-2.5 text-sm text-gray-300 transition hover:text-white">
+            Update balance
+          </button>
+        </React.Fragment>
+      ) : (
+        <form onSubmit={save} className="mt-2">
+          <p className="text-xs leading-relaxed text-gray-400">
+            OpenAI does not let apps read your balance. Enter what your billing page shows now, and the app will
+            count down as it spends.
+          </p>
+          <div className="mt-3 flex gap-2">
+            <div className="relative flex-1">
+              <span className="pointer-events-none absolute left-3.5 top-1/2 -translate-y-1/2 text-sm text-gray-500">$</span>
+              <input className={inputClass + ' pl-7'} type="text" inputMode="decimal" value={draft}
+                onChange={e => setDraft(e.target.value)} placeholder="18.40" aria-label="Current OpenAI balance in US dollars" />
+            </div>
+            <button type="submit"
+              className="no-tap shrink-0 rounded-xl bg-indigo-600 px-4 text-sm font-semibold text-white transition hover:bg-indigo-500">
+              Save
+            </button>
+          </div>
+          {editing ? (
+            <button type="button" onClick={() => setEditing(false)}
+              className="no-tap mt-2 w-full rounded-lg px-4 py-1.5 text-xs text-gray-500 transition hover:text-gray-300">
+              Cancel
+            </button>
+          ) : null}
+        </form>
+      )}
+
+      <p className="mt-3 border-t border-gray-700/60 pt-2.5 text-[11px] leading-relaxed text-gray-500">
+        An estimate. It counts only what this app spends, on this device, at OpenAI's list prices as of {PRICES_AS_OF}.
+        Other apps or devices using the same account are not included — the link above always shows the true number.
+      </p>
+    </div>
+  );
+}
+
 function SetupScreen({ initial, onSaved, onCancel, pushToast, learnerId, resetInfo }) {
   const [confirmingReset, setConfirmingReset] = useState(false);
   const [openaiKey, setOpenaiKey] = useState(initial ? initial.openaiKey : '');
@@ -2135,6 +2353,8 @@ function SetupScreen({ initial, onSaved, onCancel, pushToast, learnerId, resetIn
           </button>
         ) : null}
       </form>
+
+      {resetInfo ? <BalanceCard /> : null}
 
       {resetInfo ? (
         <div className="mt-8 rounded-2xl border border-red-500/30 bg-red-500/5 p-4">
@@ -3954,6 +4174,7 @@ function App() {
   const audioRef = useRef(null);
   const audioUrlRef = useRef(null);
   const recorderRef = useRef(null);
+  const recordStartRef = useRef(0);
   const streamRef = useRef(null);
   const chunksRef = useRef([]);
   const messagesRef = useRef([]);
@@ -4687,6 +4908,10 @@ function App() {
 
       case 'conversation.item.input_audio_transcription.completed':
         upsertRealtimeItem(event.item_id, 'user', event.transcript || '');
+        // whisper-1 inside a realtime session reports its bill as a duration.
+        if (event.usage && event.usage.type === 'duration') {
+          recordSpend('transcription', costOfTranscription(event.usage.seconds));
+        }
         break;
 
       case 'conversation.item.input_audio_transcription.failed':
@@ -4713,6 +4938,7 @@ function App() {
 
       case 'response.done':
         if (statusRef.current === 'speaking') setStatus('live');
+        recordSpend('realtime', costOfRealtimeResponse(event.response && event.response.usage));
         break;
 
       case 'error': {
@@ -4857,7 +5083,7 @@ function App() {
 
   /* --------------------------------------------------------- the voice turn */
 
-  const handleRecordedAudio = useCallback(async (blob) => {
+  const handleRecordedAudio = useCallback(async (blob, seconds) => {
     if (!blob || blob.size < 1200) {
       setStatus('idle');
       pushToast('info', 'That recording was too short to hear. Hold the button a little longer.');
@@ -4866,7 +5092,7 @@ function App() {
 
     setStatus('transcribing');
     try {
-      const text = await transcribeAudio(config.openaiKey, blob, profile.target_language);
+      const text = await transcribeAudio(config.openaiKey, blob, profile.target_language, seconds);
       if (!text) {
         setStatus('idle');
         pushToast('info', 'Nothing was picked up. Try again a bit closer to the mic.');
@@ -4937,7 +5163,9 @@ function App() {
           streamRef.current = null;
         }
         recorderRef.current = null;
-        handleRecordedAudio(blob);
+        // Whisper bills by audio length, so hand the duration on for the ledger.
+        const seconds = recordStartRef.current ? (Date.now() - recordStartRef.current) / 1000 : 0;
+        handleRecordedAudio(blob, seconds);
       };
       recorder.onerror = (e) => {
         console.error(e);
@@ -4947,6 +5175,7 @@ function App() {
       };
 
       recorder.start();
+      recordStartRef.current = Date.now();
       setStatus('recording');
     } catch (err) {
       console.error(err);
