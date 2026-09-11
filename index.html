@@ -459,6 +459,7 @@ function missingLearnersTable(error) {
 const PRICES_AS_OF = '11 Sep 2026';
 const PRICES = {
   chat: { input: 2.5, cachedInput: 1.25, output: 10 },          // gpt-4o, per 1M tokens
+  chatMini: { input: 0.15, cachedInput: 0.075, output: 0.6 },   // gpt-4o-mini, per 1M tokens
   realtime: {                                                   // gpt-realtime, per 1M tokens
     textIn: 4, audioIn: 32, cachedIn: 0.4, textOut: 16, audioOut: 64
   },
@@ -506,12 +507,13 @@ function recordSpend(category, usd) {
   saveSpend(s);
 }
 
-function costOfChat(usage) {
+function costOfChat(usage, model) {
   if (!usage) return 0;
+  const rate = model === 'gpt-4o-mini' ? PRICES.chatMini : PRICES.chat;
   const prompt = usage.prompt_tokens || 0;
   const cached = (usage.prompt_tokens_details && usage.prompt_tokens_details.cached_tokens) || 0;
   const out = usage.completion_tokens || 0;
-  return ((prompt - cached) * PRICES.chat.input + cached * PRICES.chat.cachedInput + out * PRICES.chat.output) / 1e6;
+  return ((prompt - cached) * rate.input + cached * rate.cachedInput + out * rate.output) / 1e6;
 }
 
 // Cached tokens are a subset of the input tokens of each modality, so they are
@@ -564,6 +566,79 @@ async function openaiError(res) {
     try { detail = await res.text(); } catch (e2) { detail = ''; }
   }
   return new Error('OpenAI ' + res.status + ': ' + (detail || res.statusText));
+}
+
+/* ------------------------------------------------------------- reply hints */
+
+// After each partner turn: a few ways the learner could start their answer,
+// pitched at their level and built around the phrases they are practising, so
+// they can see how to structure a sentence rather than only what to talk about.
+// A cheap, fast model, because the hints must be ready before the partner has
+// finished speaking.
+const HINT_MODEL = 'gpt-4o-mini';
+
+async function generateReplyHints(apiKey, profile, topic, recentTurns, partnerLine, targets) {
+  const level = profile.current_cefr;
+  const lang = profile.target_language;
+  const gloss = level === 'A1' || level === 'A2';
+  const L = levelSpec(level);
+  const history = (recentTurns || []).slice(-6)
+    .map(m => (m.role === 'user' ? 'LEARNER: ' : 'PARTNER: ') + m.content).join('\n');
+  const practice = (targets || []).slice(0, 12).map(t => '- ' + t).join('\n');
+
+  const raw = await chatCompletion(apiKey, [
+    {
+      role: 'system',
+      content: 'You coach a language learner during a live conversation by showing them how they could answer. ' +
+        'You write only correct, natural ' + lang + '. You always reply with a single valid JSON object and nothing else.'
+    },
+    {
+      role: 'user',
+      content: [
+        'Learner level: CEFR ' + level + '. Language: ' + lang + '. Topic: ' + topic + '.',
+        history ? 'Conversation so far:\n' + history : '',
+        'The partner has just said: "' + partnerLine + '"',
+        practice ? 'Phrases the learner is practising:\n' + practice : '',
+        '',
+        'Give the learner a scaffold for answering THAT, in their own words:',
+        '- "frames": 2 or 3 different ways to START their answer. Each is a sentence frame in ' + lang + ' with "…" ' +
+          'where the learner adds their own content. Show a different structure in each (for example a plain ' +
+          'statement, one giving a reason, one comparing or contrasting). Pitch them exactly at ' + level + ': ' +
+          L.grammar + '. Keep each one ' + L.sentences + '.',
+        '- Where one of the practice phrases fits naturally, build a frame around it and copy that phrase into ' +
+          '"uses" exactly as listed. Never force one in.',
+        gloss
+          ? '- "gloss": a short English meaning for each frame, because the learner is at ' + level + '.'
+          : '- "gloss": always "".',
+        '- "words": up to 4 words or short chunks they will likely need for this answer, with an English translation. ' +
+          'Nouns with their article in gendered languages.',
+        '- Every frame must be grammatically correct ' + lang + ' once the gap is filled. Never write the whole ' +
+          'answer for them: leave the content to the learner.',
+        '',
+        'Return ONLY: { "frames": [ { "text": "string", "gloss": "string", "uses": "string" } ], ' +
+          '"words": [ { "word": "string", "translation": "string" } ] }. Raw JSON, no fences.'
+      ].filter(Boolean).join('\n')
+    }
+  ], { json: true, temperature: 0.5, maxTokens: 350, model: HINT_MODEL });
+
+  const cleaned = raw.replace(/^```(?:json)?/i, '').replace(/```$/, '').trim();
+  const parsed = JSON.parse(cleaned);
+  const known = new Set((targets || []).map(normalizeText));
+  return {
+    frames: (Array.isArray(parsed.frames) ? parsed.frames : [])
+      .filter(f => f && f.text && String(f.text).trim())
+      .slice(0, 3)
+      .map(f => ({
+        text: String(f.text).trim(),
+        gloss: gloss && f.gloss ? String(f.gloss).trim() : '',
+        // Only trust a "uses" that really is one of the learner's phrases.
+        uses: f.uses && known.has(normalizeText(f.uses)) ? String(f.uses).trim() : ''
+      })),
+    words: (Array.isArray(parsed.words) ? parsed.words : [])
+      .filter(w => w && w.word)
+      .slice(0, 4)
+      .map(w => ({ word: String(w.word).trim(), translation: w.translation ? String(w.translation).trim() : '' }))
+  };
 }
 
 /* ------------------------------------------------------- verbatim transcription */
@@ -625,8 +700,9 @@ async function transcribeAudio(apiKey, blob, language, durationSec, level, opts)
 
 async function chatCompletion(apiKey, messages, options) {
   const opts = options || {};
+  const model = opts.model || 'gpt-4o';
   const payload = {
-    model: 'gpt-4o',
+    model: model,
     messages: messages,
     temperature: typeof opts.temperature === 'number' ? opts.temperature : 0.8
   };
@@ -643,7 +719,7 @@ async function chatCompletion(apiKey, messages, options) {
   });
   if (!res.ok) throw await openaiError(res);
   const data = await res.json();
-  recordSpend('chat', costOfChat(data.usage));
+  recordSpend('chat', costOfChat(data.usage, model));
   const choice = data.choices && data.choices[0];
   return (choice && choice.message && choice.message.content ? choice.message.content : '').trim();
 }
@@ -4322,7 +4398,7 @@ function StageStrip({ stage, messages, language }) {
       <button type="button" onClick={() => setOpen(!open)}
         className="no-tap flex w-full items-center justify-between gap-2 text-left">
         <span className="truncate text-xs font-semibold text-indigo-300">
-          {stage.focus ? 'Focused · ' : 'Stage ' + stage.position + ' · '}{stage.title}
+          {stage.label ? stage.label : (stage.focus ? 'Focused · ' : 'Stage ' + stage.position + ' · ') + stage.title}
         </span>
         <span className="flex shrink-0 items-center gap-1.5 text-[11px] text-gray-400">
           <span className="tabular-nums">{saidNow}/{phrases.length} said</span>
@@ -4354,16 +4430,94 @@ function StageStrip({ stage, messages, language }) {
               </span>
             ))}
           </div>
-          <div className="mt-1.5 text-[10px] text-gray-600">Goals are judged after the session from what you said.</div>
+          {checks.length ? (
+            <div className="mt-1.5 text-[10px] text-gray-600">Goals are judged after the session from what you said.</div>
+          ) : null}
         </div>
       ) : null}
     </div>
   );
 }
 
+// Mark the practice phrase inside a frame, without innerHTML. Frames often
+// use it conjugated ("sich freuen auf" -> "Ich freue mich auf"), which no
+// substring search finds; then the frame is tagged with the phrase instead.
+function FrameText({ text, uses }) {
+  if (!uses) return <React.Fragment>{text}</React.Fragment>;
+  const i = text.toLowerCase().indexOf(uses.toLowerCase());
+  if (i === -1) {
+    return (
+      <React.Fragment>
+        {text}
+        <span className="ml-1.5 whitespace-nowrap rounded bg-amber-500/20 px-1 py-px align-middle text-[10px] font-medium text-amber-200">
+          ↳ {uses}
+        </span>
+      </React.Fragment>
+    );
+  }
+  return (
+    <React.Fragment>
+      {text.slice(0, i)}
+      <span className="rounded bg-amber-500/20 px-0.5 text-amber-200">{text.slice(i, i + uses.length)}</span>
+      {text.slice(i + uses.length)}
+    </React.Fragment>
+  );
+}
+
+// Ways to start an answer to what the partner just said. Sits right above the
+// mic, where the learner looks before speaking.
+function HintPanel({ hints, on, onToggle }) {
+  if (!on) {
+    return (
+      <button type="button" onClick={onToggle}
+        className="no-tap mb-3 rounded-full border border-gray-700 px-3 py-1 text-[11px] text-gray-400 transition hover:text-white">
+        Show answer hints
+      </button>
+    );
+  }
+  if (!hints) return null;
+
+  return (
+    <div className="mb-3 w-full rounded-2xl border border-gray-800 bg-gray-800/60 p-3 text-left">
+      <div className="mb-1.5 flex items-center justify-between">
+        <span className="text-[11px] font-semibold uppercase tracking-wider text-indigo-300">Try saying</span>
+        <button type="button" onClick={onToggle}
+          className="no-tap text-[11px] text-gray-500 transition hover:text-gray-300">Hide</button>
+      </div>
+
+      {hints.loading ? (
+        <div className="space-y-1.5 py-0.5">
+          <div className="h-3 w-4/5 animate-pulse rounded bg-gray-700" />
+          <div className="h-3 w-3/5 animate-pulse rounded bg-gray-700" />
+        </div>
+      ) : (
+        <React.Fragment>
+          <div className="space-y-1.5">
+            {hints.frames.map((f, i) => (
+              <div key={i} className="text-sm leading-snug text-gray-100">
+                <FrameText text={f.text} uses={f.uses} />
+                {f.gloss ? <div className="text-[11px] leading-snug text-gray-500">{f.gloss}</div> : null}
+              </div>
+            ))}
+          </div>
+          {hints.words.length ? (
+            <div className="mt-2 flex flex-wrap gap-1 border-t border-gray-700/60 pt-2">
+              {hints.words.map((w, i) => (
+                <span key={i} className="rounded-md bg-gray-900/70 px-1.5 py-0.5 text-[11px] text-gray-300">
+                  {w.word}{w.translation ? <span className="text-gray-500"> · {w.translation}</span> : null}
+                </span>
+              ))}
+            </div>
+          ) : null}
+        </React.Fragment>
+      )}
+    </div>
+  );
+}
+
 function SessionScreen({
   profile, topic, messages, status, secondsLeft, onToggleMic, onEnd, micDisabled, vocabCount,
-  mode, muted, connectionState, stageInfo
+  mode, muted, connectionState, stageInfo, hints, hintsOn, onToggleHints
 }) {
   const isLive = mode === MODE_REALTIME;
   const isRecording = status === 'recording' || status === 'listening';
@@ -4422,8 +4576,9 @@ function SessionScreen({
         <TranscriptView messages={messages} status={status} targetLanguage={profile.target_language} live={isLive} />
       </main>
 
-      <footer className="safe-b border-t border-gray-800 bg-gray-900/80 px-5 pb-6 pt-5 backdrop-blur">
+      <footer className="safe-b border-t border-gray-800 bg-gray-900/80 px-5 pb-6 pt-4 backdrop-blur">
         <div className="flex flex-col items-center gap-3">
+          <HintPanel hints={hints} on={hintsOn} onToggle={onToggleHints} />
           <button onClick={onToggleMic} disabled={micDisabled || (isLive ? status === 'connecting' || status === 'analyzing' : isBusy)}
             className={'no-tap flex h-24 w-24 items-center justify-center rounded-full transition-all duration-200 active:scale-95 disabled:opacity-60 ' + buttonClass}
             aria-label={isLive ? (muted ? 'Unmute microphone' : 'Mute microphone') : (isRecording ? 'Stop recording' : 'Start recording')}>
@@ -4759,6 +4914,10 @@ function App() {
   const [profilesBusy, setProfilesBusy] = useState(false);
   const [island, setIsland] = useState(null);
   const [celebration, setCelebration] = useState(null);
+  const [hints, setHints] = useState(null);
+  const [hintsOn, setHintsOn] = useState(() => {
+    try { return localStorage.getItem('fluentloop.hints') !== 'off'; } catch (e) { return true; }
+  });
   const [stages, setStages] = useState([]);
   const [islandOpen, setIslandOpen] = useState(false);
   const [islandBusy, setIslandBusy] = useState(false);
@@ -4836,6 +4995,10 @@ function App() {
   const realtimeDcRef = useRef(null);
   const realtimeItemsRef = useRef([]);
   const transcriberFallbackRef = useRef(false);
+  const hintSeqRef = useRef(0);
+  const hintsOnRef = useRef(true);
+  const sessionTopicRef = useRef('');
+  const requestHintsRef = useRef(() => {});
   const modeRef = useRef(MODE_TURN);
   const languageRef = useRef('German');
   const learnerRef = useRef(DEFAULT_USER);
@@ -4845,6 +5008,7 @@ function App() {
   useEffect(() => { modeRef.current = mode; }, [mode]);
   useEffect(() => { languageRef.current = language; }, [language]);
   useEffect(() => { learnerRef.current = learnerId; }, [learnerId]);
+  useEffect(() => { hintsOnRef.current = hintsOn; }, [hintsOn]);
 
   const changeMode = useCallback((next) => {
     setMode(next);
@@ -5530,6 +5694,51 @@ function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [secondsLeft, screen]);
 
+  /* ----------------------------------------------------------- reply hints */
+
+  // The phrases this session is practising: the stage's own when on an island,
+  // otherwise the least-practised of the active vocabulary.
+  const sessionTargets = useCallback(() => {
+    const stage = sessionStageRef.current;
+    if (stage && Array.isArray(stage.phrases) && stage.phrases.length) return stage.phrases.map(p => p.phrase);
+    return sessionVocabRef.current
+      .slice()
+      .sort((a, b) => (a.times_reviewed || 0) - (b.times_reviewed || 0))
+      .slice(0, 8)
+      .map(v => v.phrase);
+  }, []);
+
+  const requestHints = useCallback((partnerLine) => {
+    if (!hintsOnRef.current || !partnerLine || !config || !profile) return;
+    const seq = ++hintSeqRef.current;
+    setHints({ loading: true, frames: [], words: [] });
+    generateReplyHints(config.openaiKey, profile, sessionTopicRef.current, messagesRef.current, partnerLine, sessionTargets())
+      .then(h => {
+        // A newer partner turn has arrived since: its hints win.
+        if (seq === hintSeqRef.current) setHints({ loading: false, frames: h.frames, words: h.words });
+      })
+      .catch(err => {
+        console.warn('Reply hints unavailable for this turn', err);
+        if (seq === hintSeqRef.current) setHints(null);
+      });
+  }, [config, profile, sessionTargets]);
+  useEffect(() => { requestHintsRef.current = requestHints; }, [requestHints]);
+
+  const toggleHints = useCallback(() => {
+    setHintsOn(prev => {
+      const next = !prev;
+      try { localStorage.setItem('fluentloop.hints', next ? 'on' : 'off'); } catch (e) { /* storage blocked */ }
+      hintsOnRef.current = next;
+      if (!next) { hintSeqRef.current += 1; setHints(null); }
+      else {
+        // Turning hints back on should help with the question already on screen.
+        const last = messagesRef.current.slice().reverse().find(m => m.role === 'assistant');
+        if (last) setTimeout(() => requestHintsRef.current(last.content), 0);
+      }
+      return next;
+    });
+  }, []);
+
   /* ------------------------------------------------------- realtime session */
 
   const teardownRealtime = useCallback(() => {
@@ -5592,6 +5801,7 @@ function App() {
       case 'response.output_audio_transcript.done':
       case 'response.audio_transcript.done':
         upsertRealtimeItem(event.item_id, 'assistant', event.transcript || '');
+        requestHintsRef.current(event.transcript || '');
         break;
 
       case 'input_audio_buffer.speech_started':
@@ -5708,6 +5918,9 @@ function App() {
 
     endingRef.current = false;
     setTopic(chosenTopic);
+    sessionTopicRef.current = chosenTopic;
+    hintSeqRef.current += 1;
+    setHints(null);
     setMessages([]);
     messagesRef.current = [];
     sessionLengthRef.current = focus ? FOCUS_SESSION_SECONDS : SESSION_SECONDS;
@@ -5769,6 +5982,7 @@ function App() {
       const next = [{ role: 'assistant', content: opener }];
       setMessages(next);
       messagesRef.current = next;
+      requestHints(opener);
 
       const speech = await synthesizeSpeech(config.openaiKey, opener, config.voice, levelSpec(profile.current_cefr).speed);
       await playAudioBlob(speech);
@@ -5777,7 +5991,7 @@ function App() {
       pushToast('error', err.message);
       setStatus('idle');
     }
-  }, [client, profile, vocab, allVocab, config, mode, currentStage, island, startRealtimeSession, playAudioBlob, pushToast]);
+  }, [client, profile, vocab, allVocab, config, mode, currentStage, island, startRealtimeSession, playAudioBlob, pushToast, requestHints]);
 
   /* --------------------------------------------------------- the voice turn */
 
@@ -5815,6 +6029,7 @@ function App() {
       const withAssistant = messagesRef.current.concat([{ role: 'assistant', content: reply }]);
       setMessages(withAssistant);
       messagesRef.current = withAssistant;
+      requestHints(reply);
 
       setStatus('synthesizing');
       const speech = await synthesizeSpeech(config.openaiKey, reply, config.voice, levelSpec(profile.current_cefr).speed);
@@ -5824,7 +6039,7 @@ function App() {
       pushToast('error', err.message);
       setStatus('idle');
     }
-  }, [config, profile, topic, playAudioBlob, pushToast]);
+  }, [config, profile, topic, playAudioBlob, pushToast, requestHints]);
 
   const startRecording = useCallback(async () => {
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
@@ -6771,9 +6986,20 @@ function App() {
           mode={mode}
           muted={muted}
           connectionState={connectionState}
+          hints={hints}
+          hintsOn={hintsOn}
+          onToggleHints={toggleHints}
           stageInfo={(() => {
             const pinned = sessionStageRef.current;
-            if (!pinned) return null;
+            if (!pinned) {
+              // Outside an island, show the phrases this session is practising.
+              const byPhrase = new Map(sessionVocabRef.current.map(v => [v.phrase, v]));
+              const phrases = sessionTargets().map(ph => {
+                const v = byPhrase.get(ph) || {};
+                return { phrase: ph, kind: v.kind, ready: false };
+              });
+              return phrases.length ? { label: 'Your phrases', phrases: phrases, checks: [] } : null;
+            }
             // Prefer the live row: its checks may have been generated after the session began.
             const live = stages.find(x => x.id === pinned.id) || pinned;
             const gate = stageGate(live, sessionAllVocabRef.current);

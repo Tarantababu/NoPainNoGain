@@ -287,6 +287,16 @@ Under the hood every row carries `target_language`, and every read and write is 
 
 Pick a topic (recommended, or your own) and talk for thirty minutes. The countdown is visible, and hitting `00:00` triggers the analysis automatically. You can end early with **End & Analyze** at any point.
 
+### Help while you speak
+
+Two things stay on screen during every session.
+
+**Your phrases**, along the top: the phrases this session is practising — the stage's own on an island, otherwise the least-practised of your active vocabulary — as chips that tick the moment you say them.
+
+**Try saying**, just above the mic: after each thing your partner says, two or three ways to *start* your answer, each a sentence frame with gaps for your own content (*"Letztes Wochenende habe ich … gemacht."*) and each showing a different structure — a plain statement, a reason, a contrast. They are pitched at your level's grammar, built around your practice phrases where one fits (tagged ↳ when it appears conjugated), come with an English gloss at A1–A2, and add up to four words you are likely to need. They are frames, not scripts: the content is left to you.
+
+Hints are generated with `gpt-4o-mini` — about $0.0002 a turn, fast enough to be ready before your partner finishes speaking. A reply that arrives late for an earlier question is discarded rather than shown over the current one. **Hide** collapses them and stops generating (so it stops costing), and the choice is remembered.
+
 ### Your mistakes stay in the transcript
 
 Feedback can only catch mistakes the transcriber leaves in, and speech recognisers are trained to produce clean text — `whisper-1` in particular quietly repairs non-native grammar, so *"Gestern ich habe nach Hause gegangen"* could reach the analysis as the correct *"Gestern bin ich nach Hause gegangen"* and never be flagged.
@@ -406,7 +416,7 @@ Adapt Naturally sounds like a real conversation. Force Verbatim is better when y
 
 - **Single file.** All markup, styles, components and API plumbing live in `index.html`.
 - **Babel is pinned to `7.26.4`.** Unpinned `@babel/standalone` now resolves to v8, which defaults JSX to the automatic runtime and emits an `import` statement — that breaks an in-browser transform with `Cannot use import statement outside a module`.
-- **Models:** `gpt-4o-transcribe` (with `whisper-1` as fallback), `gpt-4o`, `tts-1`, `gpt-realtime`.
+- **Models:** `gpt-4o-transcribe` (with `whisper-1` as fallback), `gpt-4o`, `gpt-4o-mini` (answer hints), `tts-1`, `gpt-realtime`.
 - **Mobile-first dark UI**, built with the Tailwind CDN build.
 - **Logo** lives in `assets/`: `logo.svg` (the mark, inheriting `currentColor`), `logo-tile.svg` (the app icon on
   indigo), and `logo-wordmark.svg` (horizontal lockup). The favicon is the same mark inlined as a data URI, so the
